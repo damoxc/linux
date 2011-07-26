@@ -234,7 +234,7 @@ void bio_free(struct bio *bio, struct bio_set *bs)
 {
 	void *p;
 
-	if (bio_has_allocated_vec(bio))
+	if (bio_flagged(bio, BIO_HAS_VEC))
 		bvec_free_bs(bs, bio->bi_io_vec, BIO_POOL_IDX(bio));
 
 	if (bio_integrity(bio))
@@ -301,6 +301,7 @@ struct bio *bio_alloc_bioset(gfp_t gfp_mask, int nr_iovecs, struct bio_set *bs)
 			goto err_free;
 
 		nr_iovecs = bvec_nr_vecs(idx);
+		bio->bi_flags |= 1 << BIO_HAS_VEC;
 	}
 out_set:
 	bio->bi_flags |= idx << BIO_POOL_OFFSET;
@@ -420,7 +421,11 @@ void bio_put(struct bio *bio)
 	 */
 	if (atomic_dec_and_test(&bio->bi_cnt)) {
 		bio->bi_next = NULL;
-		bio->bi_destructor(bio);
+
+		if (bio_flagged(bio, BIO_HAS_POOL))
+			bio_free(bio, (void *) bio->bi_destructor);
+		else
+			bio->bi_destructor(bio);
 	}
 }
 EXPORT_SYMBOL(bio_put);

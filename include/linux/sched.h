@@ -1576,6 +1576,10 @@ struct task_struct {
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 	atomic_t ptrace_bp_refcnt;
 #endif
+#if defined(CONFIG_BLK_CACHE) || defined(CONFIG_BLK_CACHE_MODULE)
+	unsigned int	nr_ios;
+	unsigned int	sequential_io;
+#endif
 };
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */

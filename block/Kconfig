@@ -99,6 +99,15 @@ config BLK_DEV_THROTTLING
 
 	See Documentation/cgroups/blkio-controller.txt for more information.
 
+config BLK_CACHE
+	tristate "Block device as cache"
+	select COMPACTION
+	---help---
+	Allows a block device to be used as cache for other devices; uses
+	a btree for indexing and the layout is optimized for SSDs.
+
+	See Documentation/bcache.txt for details.
+
 endif # BLOCK
 
 config BLOCK_COMPAT

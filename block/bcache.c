@@ -309,6 +309,19 @@ BITMASK(BDEV_STATE,	struct cache_sb, flags, 61, 2);
 #define BDEV_STATE_DIRTY	2U
 #define BDEV_STATE_STALE	3U
 
+struct gc_stat {
+	unsigned		count;
+	unsigned		ms_max;
+	time_t			last;
+
+	size_t			nodes;
+	size_t			key_bytes;
+
+	size_t			nkeys;
+	uint64_t		data;
+	uint64_t		dirty;
+};
+
 struct cache_set {
 	struct list_head	list;
 	struct cache_sb		sb;
@@ -348,9 +361,7 @@ struct cache_set {
 	atomic_t		rescale;
 	uint16_t		min_prio;
 	uint8_t			need_gc;
-	time_t			last_gc;
-	unsigned		gc_ms_max;
-	unsigned		gc_count;
+	struct gc_stat		gc_stats;
 
 	struct list_head	lru;
 	struct list_head	freed;
@@ -385,7 +396,6 @@ struct cache_set {
 	atomic_long_t		writeback_keys_failed;
 	atomic_long_t		btree_write_count;
 	atomic_long_t		keys_write_count;
-	uint64_t		dirty_data;
 
 #define BUCKET_HASH_BITS	7
 	struct hlist_head	bucket_hash[];
@@ -513,7 +523,7 @@ struct cached_dev {
 	atomic_long_t		cache_hits;
 	atomic_long_t		cache_misses;
 	atomic_long_t		cache_readaheads;
-	atomic_long_t		cache_miss_collision;
+	atomic_long_t		cache_miss_collisions;
 
 	unsigned long		sequential_cutoff_average;
 	unsigned long		sequential_cutoff;
@@ -2941,12 +2951,6 @@ static void btree_sort(struct btree *b, int start, struct bset *new)
 	__btree_sort(b, start, new, &iter, false);
 }
 
-struct gc_stat {
-	size_t nodes;
-	size_t keys;
-	uint64_t dirty;
-};
-
 static void btree_mark_meta(struct cache_set *c)
 {
 	void mark_key(struct bkey *k)
@@ -3005,7 +3009,7 @@ static void __btree_mark_key(struct cache_set *c, int level, struct bkey *k)
 
 #define btree_mark_key(b, k)	__btree_mark_key(b->c, b->level, k)
 
-static int btree_gc_mark(struct btree *b, size_t *keys, size_t *dirty)
+static int btree_gc_mark(struct btree *b, size_t *keys, struct gc_stat *gc)
 {
 	uint8_t ret = 0;
 	struct bset *i;
@@ -3015,10 +3019,16 @@ static int btree_gc_mark(struct btree *b, size_t *keys, size_t *dirty)
 		cache_bug_on(i->keys && bkey_cmp(&b->key, last_key(i)) < 0,
 			     b, "found short btree key in gc");
 
+	gc->nodes++;
 	for_each_key_filter(b, k, ptr_bad) {
 		*keys += 2 + KEY_PTRS(k);
+
+		gc->key_bytes += 2 + KEY_PTRS(k);
+		gc->nkeys++;
+
+		gc->data += KEY_SIZE(k);
 		if (KEY_DIRTY(k))
-			*dirty += KEY_SIZE(k);
+			gc->dirty += KEY_SIZE(k);
 	}
 
 	for_each_key_filter(b, k, ptr_invalid) {
@@ -3081,7 +3091,7 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 		}
 
 		keys = dirty = 0;
-		stale = btree_gc_mark(r, &keys, &dirty);
+		stale = btree_gc_mark(r, &keys, gc);
 
 		if (!b->written &&
 		    (r->level || stale > 10))
@@ -3095,9 +3105,6 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 			break;
 		}
 
-		gc->nodes++;
-		gc->keys += keys;
-		gc->dirty += dirty;
 		bkey_copy_key(&b->c->gc_done, k);
 
 		pkeys = __set_blocks(b->data, pkeys + keys, b->c);
@@ -3142,8 +3149,8 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 static int btree_gc_root(struct btree *b, struct search *s, struct gc_stat *gc)
 {
 	struct btree *n = NULL;
-	size_t keys = 0, dirty = 0;
-	int ret = 0, stale = btree_gc_mark(b, &keys, &dirty);
+	size_t keys = 0;
+	int ret = 0, stale = btree_gc_mark(b, &keys, gc);
 
 	if (b->level || stale > 10)
 		n = btree_alloc(b->c, b->level, &s->insert);
@@ -3156,11 +3163,6 @@ static int btree_gc_root(struct btree *b, struct search *s, struct gc_stat *gc)
 
 	if (b->level)
 		ret = btree_gc_recurse(b, s, gc);
-
-	if (!ret) {
-		gc->nodes++;
-		gc->keys += keys;
-	}
 
 	if (!b->written || b->write) {
 		atomic_inc(&b->c->prio_blocked);
@@ -3188,10 +3190,16 @@ static void set_gc_sectors(struct cache_set *s)
 	atomic_set(&s->sectors_to_gc, s->sb.bucket_size * n / 8);
 }
 
+static unsigned btree_used(struct cache_set *c)
+{
+	uint64_t ret = c->gc_stats.key_bytes * 100;
+	return ret / ((c->gc_stats.nodes ?: 1) * btree_bytes(c));
+}
+
 static void btree_gc(struct cache_set *s)
 {
 	unsigned long pinned = 0, time = jiffies;
-	struct gc_stat stats = { 0, 0, 0 };
+	struct gc_stat stats;
 	struct search sr;
 	struct bucket *b;
 	struct cache *c;
@@ -3199,6 +3207,10 @@ static void btree_gc(struct cache_set *s)
 
 	search_init_stack(&sr);
 	sr.lock = SHORT_MAX;
+
+	memcpy(&stats, &s->gc_stats, sizeof(struct gc_stat));
+	stats.nodes = stats.key_bytes = stats.nkeys = 0;
+	stats.data = stats.dirty = 0;
 
 	spin_lock(&s->bucket_lock);
 	for_each_cache(c, s)
@@ -3256,18 +3268,20 @@ static void btree_gc(struct cache_set *s)
 
 	spin_unlock(&s->bucket_lock);
 
-	s->dirty_data	= stats.dirty << 9;
-	s->last_gc	= get_seconds();
-	s->gc_count++;
-
 	time = jiffies_to_msecs(jiffies - time);
-	s->gc_ms_max = max_t(unsigned, s->gc_ms_max, time);
-	stats.keys *= 800;
-	stats.keys /= stats.nodes * btree_bytes(s);
+
+	stats.count++;
+	stats.ms_max	= max_t(unsigned, stats.ms_max, time);
+	stats.last	= get_seconds();
+
+	stats.key_bytes *= sizeof(uint64_t);
+	stats.dirty	<<= 9;
+	stats.data	<<= 9;
+	memcpy(&s->gc_stats, &stats, sizeof(struct gc_stat));
 
 	pr_debug("gc took %lu ms, %li pinned, %i%% used, %zu btree "
-		 "buckets %li%% used, need_gc was %i now %i", time, pinned,
-		 in_use(s), stats.nodes, stats.keys, need_gc, s->need_gc);
+		 "nodes %i%% used, need_gc was %i now %i", time, pinned,
+		 in_use(s), stats.nodes, btree_used(s), need_gc, s->need_gc);
 out:
 	closure_sync(&sr.insert);
 }
@@ -3314,7 +3328,7 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 			else if (bkey_cmp(j, k) < 0)
 				cut_front(j, k);
 			else {
-				atomic_long_inc(&s->d->cache_miss_collision);
+				atomic_long_inc(&s->d->cache_miss_collisions);
 				return true;
 			}
 
@@ -5235,9 +5249,9 @@ skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
 	static struct attribute sysfs_##n =				\
 		{ .name = #n, .mode = S_IWUSR|S_IRUSR }
 
-#define sysfs_print(file, ...)						\
+#define sysfs_print(file, fmt, ...)					\
 	if (attr == &sysfs_ ## file)					\
-		return snprintf(buf, PAGE_SIZE, __VA_ARGS__)
+		return snprintf(buf, PAGE_SIZE, fmt "\n", __VA_ARGS__)
 
 #define sysfs_hprint(file, val)						\
 	if (attr == &sysfs_ ## file) {					\
@@ -5281,7 +5295,7 @@ read_attribute(cache_hits);
 read_attribute(cache_hit_ratio);
 read_attribute(cache_misses);
 read_attribute(cache_readaheads);
-read_attribute(cache_miss_collision);
+read_attribute(cache_miss_collisions);
 read_attribute(tree_depth);
 read_attribute(root_usage_percent);
 read_attribute(priority_stats);
@@ -5293,10 +5307,15 @@ read_attribute(metadata_written);
 read_attribute(bypassed);
 read_attribute(btree_avg_keys_written);
 read_attribute(active_journal_entries);
-read_attribute(dirty_data);
-read_attribute(seconds_since_gc);
+
 read_attribute(average_seconds_between_gc);
 read_attribute(gc_ms_max);
+read_attribute(seconds_since_gc);
+read_attribute(btree_nodes);
+read_attribute(btree_used_percent);
+read_attribute(average_key_size);
+read_attribute(dirty_data);
+
 read_attribute(state);
 read_attribute(writeback_keys_done);
 read_attribute(writeback_keys_failed);
@@ -5959,31 +5978,32 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 	struct cached_dev *d = container_of(kobj, struct cached_dev, kobj);
 	const char *states[] = { "no cache", "clean", "dirty", "inconsistent" };
 
-	sysfs_print(writeback, "%i\n",		d->writeback);
-	sysfs_print(writeback_running, "%i\n",	d->writeback_running);
-	sysfs_print(writeback_delay, "%i\n",	d->writeback_delay);
-	sysfs_print(writeback_percent, "%i\n",	d->writeback_percent);
+	unsigned cache_hit_ratio(struct cached_dev *d)
+	{
+		unsigned long hits = atomic_long_read(&d->cache_hits);
+		unsigned long misses = atomic_long_read(&d->cache_misses);
+		unsigned long total = hits + misses;
+		return total ? hits * 100 / total : 0;
+	}
+
+	sysfs_print(writeback, "%i",		d->writeback);
+	sysfs_print(writeback_running, "%i",	d->writeback_running);
+	sysfs_print(writeback_delay, "%i",	d->writeback_delay);
+	sysfs_print(writeback_percent, "%i",	d->writeback_percent);
 	sysfs_hprint(sequential_cutoff,		d->sequential_cutoff);
 	sysfs_hprint(sequential_cutoff_average,	d->sequential_cutoff_average);
 	sysfs_hprint(sequential_merge,		d->sequential_merge);
 	sysfs_hprint(bypassed, atomic_long_read(&d->sectors_bypassed) << 9);
-	sysfs_print(cache_hits, "%lu\n", atomic_long_read(&d->cache_hits));
-	sysfs_print(cache_misses, "%lu\n", atomic_long_read(&d->cache_misses));
-	sysfs_print(cache_readaheads, "%lu\n",
+	sysfs_print(cache_hits, "%lu", atomic_long_read(&d->cache_hits));
+	sysfs_print(cache_misses, "%lu", atomic_long_read(&d->cache_misses));
+	sysfs_print(cache_hit_ratio,	"%u", cache_hit_ratio(d));
+	sysfs_print(cache_readaheads, "%lu",
 		    atomic_long_read(&d->cache_readaheads));
-	sysfs_print(cache_miss_collision, "%lu\n",
-		    atomic_long_read(&d->cache_miss_collision));
-	sysfs_print(running, "%i\n",		atomic_read(&d->running));
-	sysfs_print(state, "%s\n",		states[BDEV_STATE(&d->sb)]);
+	sysfs_print(cache_miss_collisions, "%lu",
+		    atomic_long_read(&d->cache_miss_collisions));
+	sysfs_print(running, "%i",		atomic_read(&d->running));
+	sysfs_print(state, "%s",		states[BDEV_STATE(&d->sb)]);
 	sysfs_hprint(readahead,                 d->readahead);
-
-	if (attr == &sysfs_cache_hit_ratio) {
-		unsigned long hits = atomic_long_read(&d->cache_hits);
-		unsigned long misses = atomic_long_read(&d->cache_misses);
-		unsigned long total = hits + misses;
-		return snprintf(buf, PAGE_SIZE, "%lu%%\n",
-				total ? hits * 100 / total : 0);
-	}
 
 	if (attr == &sysfs_label) {
 		memcpy(buf, d->sb.label, SB_LABEL_SIZE);
@@ -6015,7 +6035,7 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 		atomic_long_set(&d->cache_hits, 0);
 		atomic_long_set(&d->cache_misses, 0);
 		atomic_long_set(&d->cache_readaheads, 0);
-		atomic_long_set(&d->cache_miss_collision, 0);
+		atomic_long_set(&d->cache_miss_collisions, 0);
 	}
 
 	if (attr == &sysfs_running) {
@@ -6179,9 +6199,9 @@ static int register_dev_kobj(struct cached_dev *d)
 		&sysfs_bypassed,
 		&sysfs_cache_hits,
 		&sysfs_cache_misses,
-		&sysfs_cache_readaheads,
-		&sysfs_cache_miss_collision,
 		&sysfs_cache_hit_ratio,
+		&sysfs_cache_readaheads,
+		&sysfs_cache_miss_collisions,
 		&sysfs_clear_stats,
 		&sysfs_running,
 		&sysfs_state,
@@ -6332,9 +6352,32 @@ err:
 
 /* Cache set */
 
-static ssize_t show_cache_set(struct kobject *kobj, struct attribute *attr,
-			      char *buf)
+#define sum_bdev(stat)					\
+size_t stat(struct cache_set *c)			\
+{							\
+	struct cached_dev *d;				\
+	size_t ret = 0;					\
+	list_for_each_entry(d, &c->devices, list)	\
+		ret += atomic_long_read(&d->stat);	\
+	return ret;					\
+}
+
+static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
+				char *buf)
 {
+	sum_bdev(sectors_bypassed)
+	sum_bdev(cache_hits)
+	sum_bdev(cache_misses)
+	sum_bdev(cache_readaheads)
+	sum_bdev(cache_miss_collisions)
+
+	unsigned cache_hit_ratio(struct cache_set *c)
+	{
+		unsigned long hits = cache_hits(c), misses = cache_misses(c);
+		unsigned long total = hits + misses;
+		return total ? hits * 100 / total : 0;
+	}
+
 	unsigned avg_keys_written(struct cache_set *c)
 	{
 		long writes = atomic_long_read(&c->btree_write_count);
@@ -6354,29 +6397,51 @@ static ssize_t show_cache_set(struct kobject *kobj, struct attribute *attr,
 		return (bytes * 100) / btree_bytes(c);
 	}
 
-	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
-
+	sysfs_print(synchronous,	"%i", (int) CACHE_SYNC(&c->sb));
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
-	sysfs_hprint(dirty_data,	c->dirty_data);
-	sysfs_print(synchronous,	"%i\n", (int) CACHE_SYNC(&c->sb));
-	sysfs_print(tree_depth,		"%u\n", c->root->level);
-	sysfs_print(root_usage_percent,	"%u\n", root_usage(c));
-	sysfs_print(btree_avg_keys_written, "%u\n", avg_keys_written(c));
-	sysfs_print(btree_cache_size,	"%i\n", btree_cache_size(c));
-	sysfs_print(seconds_since_gc,	"%li\n", get_seconds() - c->last_gc);
-	sysfs_print(average_seconds_between_gc,
-		    "%li\n", (get_seconds() - c->sb.last_mount) / c->gc_count);
-	sysfs_print(gc_ms_max,		"%u\n", c->gc_ms_max);
+	sysfs_print(tree_depth,		"%u", c->root->level);
+	sysfs_print(root_usage_percent,	"%u", root_usage(c));
+	sysfs_print(btree_avg_keys_written, "%u", avg_keys_written(c));
+	sysfs_print(btree_cache_size,	"%i", btree_cache_size(c));
 
-	sysfs_print(writeback_keys_done,	"%li\n",
+	sysfs_print(average_seconds_between_gc, "%li",
+		    (get_seconds() - c->sb.last_mount) / c->gc_stats.count);
+	sysfs_print(gc_ms_max,		"%u", c->gc_stats.ms_max);
+	sysfs_print(seconds_since_gc,	"%li",
+		    get_seconds() - c->gc_stats.last);
+	sysfs_print(btree_nodes,	"%zu", c->gc_stats.nodes);
+	sysfs_print(btree_used_percent,	"%u", btree_used(c));
+	sysfs_hprint(average_key_size,	c->gc_stats.data / c->gc_stats.nkeys);
+	sysfs_hprint(dirty_data,	c->gc_stats.dirty);
+
+	sysfs_print(writeback_keys_done,	"%li",
 		    atomic_long_read(&c->writeback_keys_done));
-	sysfs_print(writeback_keys_failed,	"%li\n",
+	sysfs_print(writeback_keys_failed,	"%li",
 		    atomic_long_read(&c->writeback_keys_failed));
-	sysfs_print(active_journal_entries, "%zu\n",
+	sysfs_print(active_journal_entries,	"%zu",
 		    fifo_used(&c->journal.pin));
 
+	sysfs_hprint(bypassed,		sectors_bypassed(c) << 9);
+	sysfs_print(cache_hits,		"%lu",	cache_hits(c));
+	sysfs_print(cache_misses,	"%lu", cache_misses(c));
+	sysfs_print(cache_hit_ratio,	"%u", cache_hit_ratio(c));
+	sysfs_print(cache_readaheads,	"%lu", cache_readaheads(c));
+	sysfs_print(cache_miss_collisions, "%lu", cache_miss_collisions(c));
+
 	return 0;
+}
+
+static ssize_t show_cache_set(struct kobject *kobj, struct attribute *attr,
+			      char *buf)
+{
+	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
+	ssize_t ret;
+
+	mutex_lock(&register_lock);
+	ret = __show_cache_set(c, attr, buf);
+	mutex_unlock(&register_lock);
+	return ret;
 }
 
 static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
@@ -6776,21 +6841,33 @@ static const char *register_cache_set(struct cache *c)
 {
 	static struct attribute *files[] = {
 		&sysfs_unregister,
+		&sysfs_synchronous,
 		&sysfs_bucket_size,
 		&sysfs_block_size,
 		&sysfs_tree_depth,
 		&sysfs_root_usage_percent,
-		&sysfs_btree_cache_size,
-		&sysfs_synchronous,
 		&sysfs_btree_avg_keys_written,
-		&sysfs_active_journal_entries,
-		&sysfs_dirty_data,
-		&sysfs_seconds_since_gc,
+		&sysfs_btree_cache_size,
+
 		&sysfs_average_seconds_between_gc,
 		&sysfs_gc_ms_max,
-		&sysfs_clear_stats,
+		&sysfs_seconds_since_gc,
+		&sysfs_btree_nodes,
+		&sysfs_btree_used_percent,
+		&sysfs_average_key_size,
+		&sysfs_dirty_data,
+
 		&sysfs_writeback_keys_done,
 		&sysfs_writeback_keys_failed,
+		&sysfs_active_journal_entries,
+		&sysfs_clear_stats,
+
+		&sysfs_bypassed,
+		&sysfs_cache_hits,
+		&sysfs_cache_misses,
+		&sysfs_cache_hit_ratio,
+		&sysfs_cache_readaheads,
+		&sysfs_cache_miss_collisions,
 		NULL
 	};
 	static const struct sysfs_ops ops = {
@@ -6874,9 +6951,9 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
-	sysfs_print(nbuckets,		"%lli\n", c->sb.nbuckets);
-	sysfs_print(heap_size,		"%zu\n", c->heap.size);
-	sysfs_print(discard, "%i\n", c->discard);
+	sysfs_print(nbuckets,		"%lli", c->sb.nbuckets);
+	sysfs_print(heap_size,		"%zu", c->heap.size);
+	sysfs_print(discard, "%i", c->discard);
 	sysfs_hprint(written, atomic_long_read(&c->sectors_written) << 9);
 	sysfs_hprint(btree_written,
 		     atomic_long_read(&c->btree_sectors_written) << 9);
@@ -7211,7 +7288,7 @@ err:
 static ssize_t show(struct kobject *kobj, struct kobj_attribute *attr,
 		    char *buf)
 {
-	sysfs_print(latency_warn_ms, "%i\n", latency_warn_ms);
+	sysfs_print(latency_warn_ms, "%i", latency_warn_ms);
 
 	return 0;
 }

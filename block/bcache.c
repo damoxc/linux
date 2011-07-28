@@ -247,7 +247,6 @@ struct journal {
 
 	unsigned		sectors_free;
 	uint64_t		seq;
-	uint64_t		last_seq;
 	DECLARE_FIFO(atomic_t, pin);
 
 	struct journal_write	w[2], *cur;
@@ -1942,8 +1941,7 @@ static void fill_bucket_work(struct work_struct *w)
 			goto err;
 
 	iter->top--;
-	if (!btree_iter_end(iter))
-		__btree_sort(b, 0, NULL, iter, !b->level);
+	__btree_sort(b, 0, NULL, iter, !b->level);
 
 	pr_latency(b->expires, "fill_bucket");
 
@@ -3857,7 +3855,6 @@ next_set:
 
 static void btree_journal_mark(struct cache_set *c, struct list_head *list)
 {
-	int keys = 0, stale = 0;
 	struct journal_replay *i;
 
 	list_for_each_entry(i, list, list)
@@ -3872,16 +3869,14 @@ static void btree_journal_mark(struct cache_set *c, struct list_head *list)
 			}
 
 			__btree_mark_key(c, 0, k);
-			keys++;
 		}
-
-	pr_debug("read %i keys, %i stale", keys, stale);
 }
 
 static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 				struct search *sr)
 {
 	int ret = 0, keys = 0, entries = 0;
+	atomic_t p = { 0 };
 	struct journal_replay *i =
 		list_entry(list->prev, struct journal_replay, list);
 
@@ -3890,28 +3885,31 @@ static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 	sr->insert_type = INSERT_REPLAY;
 
 	list_for_each_entry(i, list, list) {
-		pr_debug("replaying journal entry %llu last %llu keys %u",
-			 i->j.seq, i->j.last_seq, i->j.keys);
-
 		BUG_ON(last + 1 > i->j.seq);
-
-		while (++last != i->j.seq)
-			printk(KERN_ERR "bcache: journal entry %llu missing!"
-			       " (need %llu-%llu)\n", last, start, end);
+		if (last + 1 != i->j.seq)
+			printk(KERN_ERR "bcache: journal entries %llu-%llu "
+			       "missing! (replaying %llu-%llu)\n",
+			       last, i->j.seq, start, end);
 
 		/* XXX: Need to refcount journal entries.. or flush btree after
 		 * replay is done?
 		 */
+		BUG_ON(!fifo_push(&s->journal.pin, p));
+		atomic_set(&fifo_back(&s->journal.pin), 0);
 
 		for (struct bkey *k = i->j.start; k < end(&i->j); k = next(k)) {
 			pr_debug("%s", pkey(k));
 			bkey_copy(sr->keys.top, k);
 			keylist_push(&sr->keys);
 
+			sr->journal = &fifo_back(&s->journal.pin);
+			atomic_inc(sr->journal);
+
 			__btree_insert_async(sr, s);
 			BUG_ON(!keylist_empty(&sr->keys));
 			keys++;
 		}
+		last = i->j.seq;
 		entries++;
 	}
 
@@ -4029,6 +4027,8 @@ static bool journal_full(struct cache_set *c)
 	return !KEY_PTRS(&c->journal.cur->key) || fifo_full(&c->journal.pin);
 }
 
+#define last_seq(j)	((j)->seq - fifo_used(&(j)->pin) + 1)
+
 static void btree_journal_reclaim(struct cache_set *s)
 {
 	struct cache *c;
@@ -4048,12 +4048,10 @@ static void btree_journal_reclaim(struct cache_set *s)
 	if (full)
 		pr_debug("journal_pin popped");
 
-	s->journal.last_seq = s->journal.seq - fifo_used(&s->journal.pin) + 1;
-
 	for_each_cache(c, s)
 		while (!fifo_empty(&c->journal) &&
 		       fifo_front(&c->journal).sector != c->journal_start &&
-		       fifo_front(&c->journal).seq < s->journal.last_seq) {
+		       fifo_front(&c->journal).seq < last_seq(&s->journal)) {
 			fifo_pop(&c->journal, j);
 			c->journal_end = j.sector;
 		}
@@ -4098,20 +4096,19 @@ static void btree_journal_next(struct cache_set *s)
 		BUG_ON(!fifo_push(&c->journal, seq));
 	}
 
-	w->data->last_seq = s->journal.last_seq;
-
 	w = s->journal.cur = w == s->journal.w
 		? &s->journal.w[1]
 		: &s->journal.w[0];
 
+	BUG_ON(!fifo_push(&s->journal.pin, p));
+	atomic_set(&fifo_back(&s->journal.pin), 0);
+
 	w->need_write		= false;
 	w->data->keys		= 0;
 	w->data->seq		= ++s->journal.seq;
+	w->data->last_seq	= last_seq(&s->journal);
 
 	__btree_journal_meta(s);
-
-	BUG_ON(!fifo_push(&s->journal.pin, p));
-	atomic_set(&fifo_back(&s->journal.pin), 0);
 
 	if (fifo_full(&s->journal.pin))
 		pr_debug("journal_pin full (%zu)", fifo_used(&s->journal.pin));

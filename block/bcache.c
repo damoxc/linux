@@ -1312,10 +1312,18 @@ static void rescale_heap(struct cache_set *s, int sectors)
 
 static inline void bucket_add_heap(struct cache *c, struct bucket *b)
 {
-	if (b->prio != btree_prio &&
-	    b->mark >= 0 &&
-	    bucket_gc_gen(b) < 96U)
-		heap_add(&c->heap, b, heap, bucket_cmp);
+	if (!b->mark)
+		b->prio = 0;
+
+	if (b->mark >= 0 &&
+	    bucket_gc_gen(b) < 96U) {
+		if (!b->mark &&
+		    bucket_disk_gen(b) < 64U &&
+		    fifo_push(&c->btree_freed, b - c->buckets))
+			atomic_inc(&b->pin);
+		else if (b->prio != btree_prio)
+			heap_add(&c->heap, b, heap, bucket_cmp);
+	}
 }
 
 static long pop_heap(struct cache *c)
@@ -1569,23 +1577,13 @@ again:
 	return -1;
 }
 
-static void unpop_bucket(struct cache_set *s, struct bkey *k)
+static void unpop_bucket(struct cache_set *c, struct bkey *k)
 {
 	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
-		struct cache *c = PTR_CACHE(s, k, i);
-		size_t n = PTR_BUCKET_NR(s, k, i);
-		struct bucket *b = c->buckets + n;
+		struct bucket *b = PTR_BUCKET(c, k, i);
 
-		BUG_ON(n < c->sb.first_bucket || n >= c->sb.nbuckets);
-
-		if (bucket_gc_gen(b) < 96U &&
-		    bucket_disk_gen(b) < 64U &&
-		    fifo_push(&c->btree_freed, n)) {
-			atomic_inc(&b->pin);
-		} else {
-			b->prio = b->mark = 0;
-			bucket_add_heap(c, b);
-		}
+		b->mark = 0;
+		bucket_add_heap(PTR_CACHE(c, k, i), b);
 	}
 }
 
@@ -3251,10 +3249,10 @@ static void btree_gc(struct cache_set *s)
 			cache_bug_on(gen_after(b->last_gc, b->gc_gen), c,
 				     "found old gen in gc");
 
-			b->last_gc = b->gc_gen;
-			b->gc_gen = b->gen;
-			s->need_gc = max(s->need_gc, bucket_gc_gen(b));
-			b->heap = -1;
+			b->heap		= -1;
+			b->last_gc	= b->gc_gen;
+			b->gc_gen	= b->gen;
+			s->need_gc	= max(s->need_gc, bucket_gc_gen(b));
 
 			if (b->prio)
 				s->min_prio = min(s->min_prio, b->prio);
@@ -6695,14 +6693,8 @@ static void run_cache_set(struct cache_set *c)
 
 		for_each_cache(ca, c)
 			for_each_bucket(b, ca)
-				if (!atomic_read(&b->pin)) {
-					if (!b->mark &&
-					    fifo_push(&ca->btree_freed,
-						      b - ca->buckets))
-						atomic_inc(&b->pin);
-					else
-						bucket_add_heap(ca, b);
-				}
+				if (!atomic_read(&b->pin))
+					bucket_add_heap(ca, b);
 	}
 
 	const char *err = "cannot allocate memory";

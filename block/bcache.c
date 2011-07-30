@@ -265,7 +265,8 @@ struct uuid_entry {
 	uint32_t	pad;
 };
 
-#define SB_LABEL_SIZE	32
+#define SB_LABEL_SIZE		32
+#define SB_JOURNAL_BUCKETS	256
 
 struct cache_sb {
 	uint64_t		csum;
@@ -297,7 +298,7 @@ struct cache_sb {
 
 	uint16_t		first_bucket;
 	uint16_t		keys;		/* number of journal buckets */
-	uint64_t		d[512];		/* journal buckets */
+	uint64_t		d[SB_JOURNAL_BUCKETS];	/* journal buckets */
 };
 
 BITMASK(CACHE_SYNC,	struct cache_sb, flags, 0, 1);
@@ -742,9 +743,11 @@ static void cache_init_journal(struct cache *);
 #define bucket_to_sector(c, b)	(((sector_t) (b)) << c->bucket_bits)
 #define sector_to_bucket(c, s)	((long) (s >> c->bucket_bits))
 
-#define set_bytes(i, k)		(sizeof(i) + (k) * sizeof(uint64_t))
+#define __set_bytes(i, k)	(sizeof(*(i)) + (k) * sizeof(uint64_t))
+#define set_bytes(i)		__set_bytes(i, i->keys)
+
+#define __set_blocks(i, k, c)	DIV_ROUND_UP(__set_bytes(i, k), block_bytes(c))
 #define set_blocks(i, c)	__set_blocks(i, i->keys, c)
-#define __set_blocks(i, k, c)	DIV_ROUND_UP(set_bytes(*i, k), block_bytes(c))
 
 #define node(i, j)		((struct bkey *) ((i)->d + (j)))
 #define end(i)			node(i, (i)->keys)
@@ -1899,7 +1902,7 @@ static void fill_bucket_work(struct work_struct *w)
 	struct bset *i = b->data;
 	struct btree_iter *iter = b->c->fill_iter;
 	const char *err = "bad btree header";
-	BUG_ON(b->nsets);
+	BUG_ON(b->nsets || b->written);
 
 	mutex_lock(&b->c->fill_lock);
 	iter->top = iter->sets;
@@ -1929,7 +1932,6 @@ static void fill_bucket_work(struct work_struct *w)
 		if (i->keys) {
 			cache_bug_on(bkey_cmp(&b->key, last_key(i)) < 0,
 				     b, "short btree key");
-
 
 			iter->top->k	= i->start;
 			iter->top->end	= end(i);
@@ -1993,7 +1995,7 @@ static void fill_bucket_endio(struct bio *bio, int error)
 
 static void fill_bucket(struct btree *b)
 {
-	BUG_ON(b->written);
+	BUG_ON(b->nsets || b->written);
 	BUG_ON(atomic_xchg(&b->io, 1) != -1);
 
 	cancel_delayed_work_sync(&b->work);
@@ -2190,7 +2192,7 @@ static void btree_write(struct btree *b, bool now, struct search *s)
 	/* Force write if set is too big */
 	if (!now &&
 	    !b->level &&
-	    (set_bytes(i, i->keys) < 8000 ||
+	    (set_bytes(i) < 8000 ||
 	     set_blocks(i, b->c) == __set_blocks(i, i->keys + 15, b->c)))
 		return;
 
@@ -2348,6 +2350,14 @@ out:
 	return b;
 }
 
+static void alloc_bucket_data(struct btree *b)
+{
+	int pages = KEY_SIZE(&b->key) / PAGE_SECTORS;
+	b->page_order = ilog2(max(b->c->btree_pages, pages));
+	b->data = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOIO,
+					      b->page_order);
+}
+
 static struct btree *__alloc_bucket(struct cache_set *c, gfp_t flags)
 {
 	struct btree *b = kzalloc(sizeof(*b) + sizeof(struct bio_vec) *
@@ -2389,13 +2399,13 @@ static struct btree *alloc_bucket(struct cache_set *c, struct bkey *k,
 	}
 
 	struct btree *b, *i;
-	int pages = max_t(int, c->btree_pages, KEY_SIZE(k) / PAGE_SECTORS);
+	int pages = KEY_SIZE(k) / PAGE_SECTORS;
 
 	lockdep_assert_held(&c->bucket_lock);
 	BUG_ON(list_empty(&c->lru));
 
 	b = list_entry(c->lru.prev, struct btree, lru);
-	if (pages == c->btree_pages &&
+	if (pages <= c->btree_pages &&
 	    !PTR_HASH(&b->key) &&
 	    !reap_bucket(b, NULL))
 		return init_bucket(b);
@@ -2421,9 +2431,7 @@ out:
 	if (!init_bucket(b))
 		return NULL;
 
-	b->page_order = ilog2(pages);
-	b->data = (void *) __get_free_pages(__GFP_NOWARN|GFP_NOIO,
-					    b->page_order);
+	alloc_bucket_data(b);
 	if (!b->data)
 		goto err;
 
@@ -2870,7 +2878,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 			: ptr_bad(b, k);
 	}
 
-	int oldsize = 0, order = ilog2(b->c->btree_pages), keys = 0;
+	size_t oldsize = 0, order = b->page_order, keys = 0;
 	struct bset *out = new;
 	struct bkey *k, *last = NULL;
 
@@ -2882,8 +2890,9 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 		for_each_sorted_set_start(b, i, start)
 			keys += i->keys;
 
-		order = order_base_2(set_bytes(struct bset, keys));
-		order = max(order - PAGE_SHIFT, 0);
+		order = roundup_pow_of_two(__set_bytes(i, keys)) / PAGE_SIZE;
+		if (order)
+			order = ilog2(order);
 	}
 
 	if (!out)
@@ -2891,6 +2900,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 	if (!out) {
 		mutex_lock(&b->c->sort_lock);
 		out = b->c->sort;
+		order = ilog2(bucket_pages(b->c));
 	}
 
 	while (!btree_iter_end(iter)) {
@@ -2917,7 +2927,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 
 	b->nsets = start;
 
-	if (!start) {
+	if (!start && order == b->page_order) {
 		out->magic	= bset_magic(b->c);
 		out->seq	= b->data->seq;
 		out->version	= b->data->version;
@@ -3439,7 +3449,7 @@ copy:
 			if (check_old_keys(b, k, &iter, s))
 				continue;
 
-			while (m != end(i) && bkey_cmp(k, m) > 0)
+			while (m != end(i) && bkey_cmp(k, &START_KEY(m)) > 0)
 				m = next(m);
 
 			if (merge(i, m, k))
@@ -3450,7 +3460,7 @@ copy:
 		status = "inserting";
 		shift_keys(i, m, k);
 merged:
-		check_key_order_msg(b, i, "last inserted %s", pkey(k));
+		check_key_order_msg(b, i, "was last %s %s", status, pkey(k));
 		BUG_ON(count_data(b) < oldsize);
 		ret = true;
 
@@ -3809,8 +3819,7 @@ reread:			left = c->journal_area_end - offset;
 			j = data;
 			while (len) {
 				struct list_head *where = list;
-				size_t blocks = 1, bytes =
-					set_bytes(*j, j->keys);
+				size_t blocks = 1, bytes = set_bytes(j);
 
 				if (j->magic != jset_magic(s))
 					goto next_set;
@@ -5470,7 +5479,7 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 	sb->first_bucket	= le16_to_cpu(s->first_bucket);
 	sb->keys		= le16_to_cpu(s->keys);
 
-	for (int i = 0; i < 512; i++)
+	for (int i = 0; i < SB_JOURNAL_BUCKETS; i++)
 		sb->d[i] = le64_to_cpu(s->d[i]);
 
 	pr_debug("read sb version %llu, flags %llu, seq %llu, journal size %u",
@@ -5484,7 +5493,7 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 		goto err;
 
 	err = "Too many journal buckets";
-	if (sb->keys > 512)
+	if (sb->keys > SB_JOURNAL_BUCKETS)
 		goto err;
 
 	err = "Bad checksum";
@@ -6131,6 +6140,7 @@ static void unregister_dev_kobj(struct kobject *k)
 	struct cached_dev *d = container_of(k, struct cached_dev, kobj);
 
 	/* XXX: background writeback could be in progress... */
+	cancel_work_sync(&d->refill);
 
 	mutex_lock(&register_lock);
 
@@ -6555,6 +6565,7 @@ static void unregister_cache_set(struct kobject *k)
 	closure_sync(&s.insert);
 
 	cancel_work_sync(&c->gc_work);
+	cancel_work_sync(&c->journal.work);
 
 	for_each_cache(ca, c)
 		kobject_put(&ca->kobj);
@@ -6624,8 +6635,8 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	c->journal.w[0].c = c;
 	c->journal.w[1].c = c;
 
-	iter_size = ((sb->bucket_size / sb->block_size) + 1) *
-		sizeof(void *) * 2;
+	iter_size = (sb->bucket_size / sb->block_size + 1) *
+		sizeof(struct btree_iter_set);
 
 	if (!(c->bio_split = bioset_create(64, 0)) ||
 	    !(c->fill_iter = kmalloc(iter_size, GFP_KERNEL)) ||
@@ -6643,7 +6654,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 		if (!b)
 			goto err;
 
-		list_add(&b->list, i < 8
+		list_add(&b->list, i & 1
 			 ? &c->open_buckets
 			 : &c->dirty_buckets);
 	}
@@ -6653,8 +6664,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 		if (!b)
 			goto err;
 
-		b->page_order = ilog2(c->btree_pages);
-		b->data = (void *) __get_free_pages(GFP_KERNEL, b->page_order);
+		alloc_bucket_data(b);
 		if (!b->data)
 			goto err;
 
@@ -6769,7 +6779,7 @@ static void run_cache_set(struct cache_set *c)
 
 		for_each_cache(ca, c) {
 			ca->sb.keys = clamp_t(int, ca->sb.nbuckets / 100,
-					      2, 256);
+					      2, SB_JOURNAL_BUCKETS);
 
 			for (int i = 0; i < ca->sb.keys; i++)
 				ca->sb.d[i] = ca->sb.first_bucket + i;
@@ -7036,6 +7046,7 @@ static void free_cache(struct kobject *k)
 
 	while (!list_empty(&c->discards)) {
 		d = list_first_entry(&c->discards, struct discard, list);
+		cancel_work_sync(&d->work);
 		list_del(&d->list);
 		kfree(d);
 	}

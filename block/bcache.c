@@ -839,8 +839,8 @@ do {									\
 	for (int _i = 0; c = s->cache[_i], _i < s->sb.nr_in_set; _i++)
 
 #define for_each_bucket(b, c)						\
-	for (b = c->buckets + c->sb.first_bucket;			\
-	     b < c->buckets + c->sb.nbuckets; b++)
+	for (b = (c)->buckets + (c)->sb.first_bucket;			\
+	     b < (c)->buckets + (c)->sb.nbuckets; b++)
 
 #define for_each_sorted_set_start(b, i, start)				\
 	for (int _i = start; i = b->sets[_i], _i <= b->nsets; _i++)
@@ -3321,7 +3321,7 @@ static void shift_keys(struct bset *i, struct bkey *where, struct bkey *insert)
 static bool check_old_keys(struct btree *b, struct bkey *k,
 			   struct btree_iter *iter, struct search *s)
 {
-	bool found = false, overwrote = false;
+	bool overwrote = false;
 
 	while (1) {
 		struct bkey *j = btree_iter_next(iter);
@@ -3345,15 +3345,13 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 		}
 
 		if (s->insert_type == INSERT_UNDIRTY) {
-			if (j->header == (k->header | PTR_DIRTY_BIT) &&
-			    !memcmp(&j->key, &k->key,
-				    sizeof(uint64_t) * (1 + KEY_PTRS(k))))
-				found = true;
-			else {
-				pr_debug("undirtying %s but found %s",
-					 pkey(k), pkey(j));
-				return true;
-			}
+			if (j->header != (k->header | PTR_DIRTY_BIT) ||
+			    memcmp(&j->key, &k->key, key_bytes(k) - 8))
+				goto wb_failed;
+
+			cut_back(&START_KEY(k), j);
+			atomic_long_inc(&b->c->writeback_keys_done);
+			return false;
 		}
 
 		if (bkey_cmp(k, j) < 0) {
@@ -3381,8 +3379,10 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 		overwrote = true;
 	}
 
-	if (s->insert_type == INSERT_UNDIRTY && !found)
+	if (s->insert_type == INSERT_UNDIRTY) {
+wb_failed:	atomic_long_inc(&b->c->writeback_keys_failed);
 		return true;
+	}
 
 	if (!KEY_PTRS(k) && !overwrote)
 		return true;
@@ -3471,11 +3471,6 @@ merged:
 			 status, insert_type(s), pbtree(b),
 			 index(i, b), m - i->start, i->keys, pkey(k));
 	}
-
-	/* XXX: tracepoint */
-	if (!b->level && s->insert_type == INSERT_UNDIRTY)
-		atomic_long_inc(ret ? &b->c->writeback_keys_done
-				    : &b->c->writeback_keys_failed);
 
 	return ret;
 }

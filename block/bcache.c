@@ -3083,6 +3083,13 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 	{
 		if (!r->written)
 			btree_write(r, true, s);
+		else if (r->write) {
+			BUG_ON(r->write->owner);
+			r->write->owner = &s->cl;
+			closure_get(&s->cl);
+
+			btree_write(r, true, NULL);
+		}
 
 		rw_unlock(true, r);
 	}
@@ -3207,6 +3214,7 @@ static unsigned btree_used(struct cache_set *c)
 
 static void btree_gc(struct cache_set *s)
 {
+	int ret;
 	unsigned long pinned = 0, time = jiffies;
 	struct gc_stat stats;
 	struct search sr;
@@ -3215,6 +3223,7 @@ static void btree_gc(struct cache_set *s)
 	uint8_t need_gc = 0;
 
 	search_init_stack(&sr);
+	closure_init_stack(&sr.cl);
 	sr.lock = SHORT_MAX;
 
 	memcpy(&stats, &s->gc_stats, sizeof(struct gc_stat));
@@ -3232,15 +3241,18 @@ static void btree_gc(struct cache_set *s)
 				if (!atomic_read(&b->pin))
 					b->mark = 0;
 
-	if (btree_root(gc_root, s, &sr, &stats)) {
+	ret = btree_root(gc_root, s, &sr, &stats);
+	closure_sync(&sr.insert);
+	closure_sync(&sr.cl);
+
+	if (ret) {
 		printk(KERN_WARNING "bcache: gc failed!\n");
 		queue_work(delayed, &s->gc_work);
-		goto out;
+		return;
 	}
 
 	s->gc_done = KEY(0, 0, 0);
 	set_gc_sectors(s);
-	closure_sync(&sr.insert);
 
 	/* Possibly wait for new UUIDs or whatever to hit disk */
 	btree_journal_wait(s, &sr.insert);
@@ -3291,8 +3303,6 @@ static void btree_gc(struct cache_set *s)
 	pr_debug("gc took %lu ms, %li pinned, %i%% used, %zu btree "
 		 "nodes %i%% used, need_gc was %i now %i", time, pinned,
 		 in_use(s), stats.nodes, btree_used(s), need_gc, s->need_gc);
-out:
-	closure_sync(&sr.insert);
 }
 
 static void btree_gc_work(struct work_struct *w)

@@ -1120,11 +1120,13 @@ static void bkey_put(struct cache_set *c, struct bkey *k, int write, int level)
 
 static void bset_init(struct btree *b, struct bset *i)
 {
-	if (i == b->data)
+	if (i != b->data) {
+		b->sets[++b->nsets] = i;
+		i->seq = b->data->seq;
+	} else
 		get_random_bytes(&b->data->seq, sizeof(uint64_t));
 
 	i->magic	= bset_magic(b->c);
-	i->seq		= b->data->seq;
 	i->version	= 0;
 	i->keys		= 0;
 }
@@ -3614,49 +3616,6 @@ err:
 	return -ENOMEM;
 }
 
-static int btree_insert(struct btree *b, struct search *s)
-{
-	if (should_split(b)) {
-		if (s->lock <= b->c->root->level) {
-			BUG_ON(b->level);
-			s->lock = b->c->root->level + 1;
-			return -EINTR;
-		}
-		return btree_split(b, s);
-	}
-
-	if (write_block(b) != b->sets[b->nsets]) {
-		struct bset *i;
-		unsigned keys = 0;
-
-		for_each_sorted_set(b, i)
-			keys += i->keys;
-
-		if (b->nsets > 3)
-			for (unsigned j = 0; b->nsets - j > 2; j++) {
-				if (keys > b->sets[j]->keys * 2 ||
-				    keys < 100) {
-					btree_sort(b, j, NULL);
-					break;
-				}
-
-				keys -= b->sets[j]->keys;
-			}
-
-		if (b->nsets > max(2, 4 - b->level))
-			btree_sort(b, 0, NULL);
-
-		i = write_block(b);
-		bset_init(b, i);
-		b->sets[++b->nsets] = i;
-	}
-
-	if (btree_insert_keys(b, s))
-		btree_write(b, false, s);
-
-	return 0;
-}
-
 static int btree_insert_recurse(struct btree *b, struct search *s,
 				struct keylist *stack_keys)
 {
@@ -3696,7 +3655,22 @@ static int btree_insert_recurse(struct btree *b, struct search *s,
 	}
 
 	if (!keylist_empty(&s->keys)) {
-		return btree_insert(b, s);
+		if (should_split(b)) {
+			if (s->lock <= b->c->root->level) {
+				BUG_ON(b->level);
+				s->lock = b->c->root->level + 1;
+				return -EINTR;
+			}
+			return btree_split(b, s);
+		}
+
+		if (write_block(b) != b->sets[b->nsets]) {
+			btree_sort_lazy(b);
+			bset_init(b, write_block(b));
+		}
+
+		if (btree_insert_keys(b, s))
+			btree_write(b, false, s);
 	}
 
 	return 0;
@@ -5565,8 +5539,6 @@ static ssize_t btree_fuzz(struct kobject *k, struct kobj_attribute *a,
 					break;
 
 				btree_sort_lazy(b);
-
-				b->sets[++b->nsets] = write_block(b);
 				bset_init(b, write_block(b));
 			}
 		}

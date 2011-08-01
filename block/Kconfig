@@ -99,7 +99,7 @@ config BLK_DEV_THROTTLING
 
 	See Documentation/cgroups/blkio-controller.txt for more information.
 
-config BLK_CACHE
+config BCACHE
 	tristate "Block device as cache"
 	select COMPACTION
 	---help---
@@ -107,6 +107,20 @@ config BLK_CACHE
 	a btree for indexing and the layout is optimized for SSDs.
 
 	See Documentation/bcache.txt for details.
+
+config BCACHE_EDEBUG
+	bool "Extended runtime checks"
+	depends on BCACHE
+	---help---
+	Enables extra runtime checks which significantly affect performance
+
+config BCACHE_CLOSURE_DEBUG
+	bool "Debug bcache closures"
+	depends on BCACHE
+	---help---
+	Keeps all active closures in a linked list and provides a debugfs
+	interface to list them, which makes it possible to see asynchronous
+	operations that get stuck.
 
 endif # BLOCK
 

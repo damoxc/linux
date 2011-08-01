@@ -400,7 +400,7 @@ struct cache_set {
 	atomic_long_t		btree_write_count;
 	atomic_long_t		keys_write_count;
 
-#define BUCKET_HASH_BITS	7
+#define BUCKET_HASH_BITS	12
 	struct hlist_head	bucket_hash[];
 };
 
@@ -803,7 +803,8 @@ KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
 #define PTR_DEV(k, n)		((k)->ptr[n] >> 51)
 #define PTR_OFFSET(k, n)	(((k)->ptr[n] >> 8) & ~((int64_t) ~0 << 51))
 #define PTR_GEN(k, n)		((uint8_t) ((k)->ptr[n]) & 255)
-#define PTR_HASH(k)		((k)->ptr[0] >> 8)
+#define PTR_HASH(c, k)							\
+	(((k)->ptr[0] >> c->bucket_bits) | PTR_GEN(k, 0))
 
 #define PTR_CACHE(c, k, n)	(c->cache[PTR_DEV(k, n)])
 #define PTR_BUCKET_NR(c, k, n)	sector_to_bucket(c, PTR_OFFSET(k, n))
@@ -2200,31 +2201,27 @@ static void btree_write(struct btree *b, bool now, struct search *s)
 		}
 	}
 
-
 	/* Force write if set is too big */
-	if (!now &&
-	    !b->level &&
-	    (set_bytes(i) < 8000 ||
-	     set_blocks(i, b->c) == __set_blocks(i, i->keys + 15, b->c)))
-		return;
-
+	if (now ||
+	    b->level ||
+	    set_bytes(i) > PAGE_SIZE - 48) {
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
-	if (!b->write->wait_time)
-		set_wait(b->write);
+		if (!b->write->wait_time)
+			set_wait(b->write);
 #endif
-	if (s && now) {
-		/* Must wait on multiple writes */
-		BUG_ON(b->write->owner);
-		b->write->owner = &s->insert;
-		closure_get(&s->insert);
-	}
+		if (s && now) {
+			/* Must wait on multiple writes */
+			BUG_ON(b->write->owner);
+			b->write->owner = &s->insert;
+			closure_get(&s->insert);
+		}
 
-	if (__btree_write(b)) {
-		b->expires = jiffies;
-		if (b->work.timer.function)
-			mod_timer_pending(&b->work.timer, b->expires);
+		if (__btree_write(b)) {
+			b->expires = jiffies;
+			if (b->work.timer.function)
+				mod_timer_pending(&b->work.timer, b->expires);
+		}
 	}
-
 	BUG_ON(!b->written);
 }
 
@@ -2331,7 +2328,7 @@ static int shrink_buckets(int nr, gfp_t flags)
 
 static struct hlist_head *hash_bucket(struct cache_set *c, struct bkey *k)
 {
-	return &c->bucket_hash[hash_64(PTR_HASH(k), BUCKET_HASH_BITS)];
+	return &c->bucket_hash[hash_32(PTR_HASH(c, k), BUCKET_HASH_BITS)];
 }
 
 static struct btree *find_bucket(struct cache_set *c, struct bkey *k)
@@ -2341,7 +2338,7 @@ static struct btree *find_bucket(struct cache_set *c, struct bkey *k)
 
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(b, cursor, hash_bucket(c, k), hash)
-		if (PTR_HASH(&b->key) == PTR_HASH(k))
+		if (PTR_HASH(c, &b->key) == PTR_HASH(c, k))
 			goto out;
 	b = NULL;
 out:
@@ -2405,7 +2402,7 @@ static struct btree *alloc_bucket(struct cache_set *c, struct bkey *k,
 
 	b = list_entry(c->lru.prev, struct btree, lru);
 	if (pages <= c->btree_pages &&
-	    !PTR_HASH(&b->key) &&
+	    !b->key.ptr[0] &&
 	    !reap_bucket(b, NULL))
 		return init_bucket(b);
 
@@ -2508,7 +2505,7 @@ retry:
 			downgrade_write(&b->lock);
 	} else {
 		rw_lock(write, b, level);
-		if (PTR_HASH(&b->key) != PTR_HASH(k)) {
+		if (PTR_HASH(c, &b->key) != PTR_HASH(c, k)) {
 			rw_unlock(write, b);
 			goto retry;
 		}
@@ -2630,7 +2627,7 @@ retry_alloc:
 		if (!down_write_trylock(&b->lock))
 			goto retry;
 
-		if (PTR_HASH(&b->key) != PTR_HASH(&k.key)) {
+		if (PTR_HASH(c, &b->key) != PTR_HASH(c, &k.key)) {
 			/* belt and suspenders */
 			rw_unlock(true, b);
 			spin_lock(&c->bucket_lock);
@@ -2960,24 +2957,26 @@ static void btree_sort(struct btree *b, int start, struct bset *new)
 
 static void btree_sort_lazy(struct btree *b)
 {
-	struct bset *i;
-	unsigned keys = 0;
+	if (b->nsets > 1) {
+		struct bset *i;
+		unsigned keys = 0, total;
 
-	for_each_sorted_set(b, i)
-		keys += i->keys;
+		for_each_sorted_set(b, i)
+			keys += i->keys;
+		total = keys;
 
-	if (b->nsets > 3)
-		for (unsigned j = 0; b->nsets - j > 2; j++) {
-			if (keys > b->sets[j]->keys * 2 ||
-			    keys < 100) {
+		for (unsigned j = 0; j < b->nsets; j++) {
+			if (keys * 2 < total ||
+			    keys < 1000) {
 				btree_sort(b, j, NULL);
 				return;
 			}
 
 			keys -= b->sets[j]->keys;
 		}
+	}
 
-	if (b->nsets > max(2, 4 - b->level))
+	if (b->nsets > 2 - b->level)
 		btree_sort(b, 0, NULL);
 }
 
@@ -3347,13 +3346,20 @@ static void btree_gc_work(struct work_struct *w)
 
 static void shift_keys(struct bset *i, struct bkey *where, struct bkey *insert)
 {
-	size_t len = (void *) end(i) - (void *) where;
-	int n = 2 + KEY_PTRS(insert);
-	i->keys += n;
-	BUG_ON(len && !KEY_IS_HEADER(where));
+	unsigned n = 2 + KEY_PTRS(insert);
+	uint64_t *src = i->d + i->keys;
+	uint64_t *dst = i->d + i->keys + n;
 
-	memmove((uint64_t *) where + n, where, len);
+	while (src > (uint64_t *) where) {
+		src -= 2;
+		dst -= 2;
+
+		dst[0] = src[0];
+		dst[1] = src[1];
+	}
+
 	bkey_copy(where, insert);
+	i->keys += n;
 }
 
 static bool check_old_keys(struct btree *b, struct bkey *k,
@@ -3401,7 +3407,9 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 					m = btree_bsearch(w, k);
 					shift_keys(w, m, j);
 				} else {
-					shift_keys(w, m, j);
+					BKEY_PADDED(key) temp;
+					bkey_copy(&temp.key, j);
+					shift_keys(w, m, &temp.key);
 					m = next(j);
 				}
 
@@ -5124,6 +5132,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 
 	if (sectors < 0 ||
 	    bio_rw_flagged(last_bio, BIO_RW_AHEAD) ||
+	    bio_rw_flagged(last_bio, BIO_RW_META) ||
 	    in_use(s->d->c) > CUTOFF_CACHE_READA)
 		sectors = 0;
 	else
@@ -5316,6 +5325,7 @@ read_attribute(tree_depth);
 read_attribute(root_usage_percent);
 read_attribute(priority_stats);
 read_attribute(btree_cache_size);
+read_attribute(btree_cache_max_chain);
 read_attribute(heap_size);
 read_attribute(written);
 read_attribute(btree_written);
@@ -6564,6 +6574,27 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 		return ret;
 	}
 
+	unsigned cache_max_chain(struct cache_set *c)
+	{
+		unsigned ret = 0;
+		spin_lock(&c->bucket_lock);
+
+		for (struct hlist_head *h = c->bucket_hash;
+		     h < c->bucket_hash + (1 << BUCKET_HASH_BITS);
+		     h++) {
+			unsigned i = 0;
+			struct hlist_node *p;
+
+			hlist_for_each(p, h)
+				i++;
+
+			ret = max(ret, i);
+		}
+
+		spin_unlock(&c->bucket_lock);
+		return ret;
+	}
+
 	sysfs_print(synchronous,	"%i", (int) CACHE_SYNC(&c->sb));
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
@@ -6574,6 +6605,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 			     atomic_long_read(&c->btree_write_count)));
 
 	sysfs_hprint(btree_cache_size,	cache_size(c));
+	sysfs_print(btree_cache_max_chain, "%u", cache_max_chain(c));
 
 	sysfs_print(average_seconds_between_gc, "%li",
 		    DIV_SAFE(get_seconds() - c->sb.last_mount,
@@ -6762,6 +6794,8 @@ static void unregister_cache_set_work(struct work_struct *w)
 #define alloc_bucket_pages(gfp, c)			\
 	((void *) __get_free_pages(__GFP_ZERO|gfp, ilog2(bucket_pages(c))))
 
+#define JOURNAL_PIN	20000
+
 static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 {
 	int iter_size;
@@ -6819,7 +6853,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	    !(c->fill_iter = kmalloc(iter_size, GFP_KERNEL)) ||
 	    !(c->sort = alloc_bucket_pages(GFP_KERNEL, c)) ||
 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||
-	    !(init_fifo(&c->journal.pin, 1023, GFP_KERNEL)) ||
+	    !(init_fifo(&c->journal.pin, JOURNAL_PIN, GFP_KERNEL)) ||
 	    !(c->journal.w[0].data = (void *) __get_free_pages(GFP_KERNEL,
 							       JSET_BITS)) ||
 	    !(c->journal.w[1].data = (void *) __get_free_pages(GFP_KERNEL,
@@ -7028,6 +7062,7 @@ static const char *register_cache_set(struct cache *c)
 		&sysfs_root_usage_percent,
 		&sysfs_btree_avg_keys_written,
 		&sysfs_btree_cache_size,
+		&sysfs_btree_cache_max_chain,
 
 		&sysfs_average_seconds_between_gc,
 		&sysfs_gc_ms_max,
@@ -7322,7 +7357,7 @@ static struct cache *alloc_cache(struct cache_sb *sb)
 	if (!init_fifo(&c->btree_freed,	free, GFP_KERNEL) ||
 	    !init_fifo(&c->free,	free, GFP_KERNEL) ||
 	    !init_fifo(&c->free_inc,	free << 2, GFP_KERNEL) ||
-	    !init_fifo(&c->journal,	1023, GFP_KERNEL) ||
+	    !init_fifo(&c->journal,	JOURNAL_PIN, GFP_KERNEL) ||
 	    !init_heap(&c->heap,	c->sb.nbuckets, GFP_KERNEL) ||
 	    !(c->discard_page	= alloc_page(__GFP_ZERO|GFP_KERNEL)) ||
 	    !(c->buckets	= vmalloc(sizeof(struct bucket) *

@@ -18,6 +18,6 @@ obj-$(CONFIG_IOSCHED_CFQ)	+= cfq-iosched.o
 obj-$(CONFIG_BLOCK_COMPAT)	+= compat_ioctl.o
 obj-$(CONFIG_BLK_DEV_INTEGRITY)	+= blk-integrity.o
 
-obj-$(CONFIG_BLK_CACHE)		+= bcache.o bcache_util.o
+obj-$(CONFIG_BCACHE)		+= bcache.o bcache_util.o
 CFLAGS_bcache.o			+= -std=gnu99
 CFLAGS_bcache_util.o		+= -std=gnu99

@@ -20,7 +20,7 @@ struct closure;
 
 #include <trace/events/bcache.h>
 
-#ifdef EDEBUG
+#ifdef CONFIG_BCACHE_EDEBUG
 
 #define atomic_dec_bug(v)	BUG_ON(atomic_dec_return(v) < 0)
 #define atomic_inc_bug(v, i)	BUG_ON(atomic_inc_return(v) <= i)
@@ -418,7 +418,7 @@ struct closure {
 		unsigned long		flags;
 	};
 
-#ifdef CLOSURE_DEBUG
+#ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 	struct list_head	all;
 	unsigned long		waiting_on;
 #endif
@@ -434,7 +434,7 @@ bool closure_wait(closure_list_t *list, struct closure *c);
 void closure_sync(struct closure *c);
 void __closure_sleep(struct closure *c);
 
-#ifdef CLOSURE_DEBUG
+#ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 extern struct list_head closures;
 extern spinlock_t closure_lock;
 

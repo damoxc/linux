@@ -1532,7 +1532,7 @@ again:
 	     fifo_used(&c->free) > 8) &&
 	    fifo_pop(&c->free, r)) {
 		struct bucket *b = c->buckets + r;
-#ifdef EDEBUG
+#ifdef CONFIG_BCACHE_EDEBUG
 		long i;
 		for (i = 0; i < prio_buckets(c); i++)
 			BUG_ON(c->prio_buckets[i] == r);
@@ -1835,7 +1835,7 @@ dump_key_and_panic(struct btree *b, struct bset *i, int j)
 	dump_bucket_and_panic(b, "");
 }
 
-#ifdef EDEBUG
+#ifdef CONFIG_BCACHE_EDEBUG
 
 static unsigned count_data(struct btree *b)
 {

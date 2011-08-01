@@ -119,7 +119,7 @@ int parse_uuid(const char *s, char *uuid)
 }
 EXPORT_SYMBOL_GPL(parse_uuid);
 
-#ifdef EDEBUG
+#ifdef CONFIG_BCACHE_EDEBUG
 
 static void check_bio(struct bio *bio)
 {
@@ -335,7 +335,7 @@ EXPORT_SYMBOL_GPL(bio_submit_split);
  * XXX: Documentation should go here.
  */
 
-#ifdef CLOSURE_DEBUG
+#ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 
 LIST_HEAD(closures);
 spinlock_t closure_lock;
@@ -355,7 +355,7 @@ void __closure_init(struct closure *c, struct closure *parent, bool onstack)
 	if (parent)
 		closure_get(parent);
 
-#ifdef CLOSURE_DEBUG
+#ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 	if (!onstack) {
 		spin_lock_irq(&closure_lock);
 		list_add(&c->all, &closures);
@@ -468,7 +468,7 @@ void closure_sync(struct closure *c)
 }
 EXPORT_SYMBOL_GPL(closure_sync);
 
-#ifdef CLOSURE_DEBUG
+#ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 
 #ifdef CONFIG_DEBUG_FS
 

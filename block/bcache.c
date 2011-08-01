@@ -219,6 +219,7 @@ struct jset {
 
 struct journal_replay {
 	struct list_head	list;
+	atomic_t		*pin;
 	struct jset		j;
 };
 
@@ -3080,8 +3081,8 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 
 	void write(struct btree *r)
 	{
-		if (!r->written || r->write)
-			btree_write(r, true, !b->written ? s : NULL);
+		if (!r->written)
+			btree_write(r, true, s);
 
 		rw_unlock(true, r);
 	}
@@ -3871,28 +3872,41 @@ next_set:
 
 static void btree_journal_mark(struct cache_set *c, struct list_head *list)
 {
-	struct journal_replay *i;
+	atomic_t p = { 0 };
+	struct journal_replay *i =
+		list_first_entry(list, struct journal_replay, list);
+	uint64_t last = i->j.seq - 1;
 
-	list_for_each_entry(i, list, list)
+	list_for_each_entry(i, list, list) {
+		while (++last != i->j.seq) {
+			BUG_ON(!fifo_push(&c->journal.pin, p));
+			atomic_set(&fifo_back(&c->journal.pin), 0);
+		}
+
+		BUG_ON(!fifo_push(&c->journal.pin, p));
+		atomic_set(&fifo_back(&c->journal.pin), 1);
+
+		i->pin = &fifo_back(&c->journal.pin);
+
 		for (struct bkey *k = i->j.start; k < end(&i->j); k = next(k)) {
 			for (unsigned j = 0; j < KEY_PTRS(k); j++) {
 				struct bucket *g = PTR_BUCKET(c, k, j);
 				atomic_inc(&g->pin);
 
-				if (g->prio == btree_prio)
+				if (g->prio == btree_prio &&
+				    !ptr_stale(c, k, j))
 					g->prio = initial_prio;
-				BUG_ON(ptr_stale(c, k, j));
 			}
 
 			__btree_mark_key(c, 0, k);
 		}
+	}
 }
 
 static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 				struct search *sr)
 {
 	int ret = 0, keys = 0, entries = 0;
-	atomic_t p = { 0 };
 	struct journal_replay *i =
 		list_entry(list->prev, struct journal_replay, list);
 
@@ -3901,30 +3915,28 @@ static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 	sr->insert_type = INSERT_REPLAY;
 
 	list_for_each_entry(i, list, list) {
+		BUG_ON(atomic_read(i->pin) != 1);
+
 		BUG_ON(last + 1 > i->j.seq);
 		if (last + 1 != i->j.seq)
 			printk(KERN_ERR "bcache: journal entries %llu-%llu "
 			       "missing! (replaying %llu-%llu)\n",
 			       last, i->j.seq, start, end);
 
-		/* XXX: Need to refcount journal entries.. or flush btree after
-		 * replay is done?
-		 */
-		BUG_ON(!fifo_push(&s->journal.pin, p));
-		atomic_set(&fifo_back(&s->journal.pin), 0);
-
 		for (struct bkey *k = i->j.start; k < end(&i->j); k = next(k)) {
 			pr_debug("%s", pkey(k));
 			bkey_copy(sr->keys.top, k);
 			keylist_push(&sr->keys);
 
-			sr->journal = &fifo_back(&s->journal.pin);
+			sr->journal = i->pin;
 			atomic_inc(sr->journal);
 
 			__btree_insert_async(sr, s);
 			BUG_ON(!keylist_empty(&sr->keys));
 			keys++;
 		}
+
+		atomic_dec(i->pin);
 		last = i->j.seq;
 		entries++;
 	}
@@ -6726,6 +6738,7 @@ static void run_cache_set(struct cache_set *c)
 			goto err;
 
 		j = &list_entry(journal.prev, struct journal_replay, list)->j;
+		c->journal.seq = j->seq;
 
 		err = "IO error reading priorities";
 		for_each_cache(ca, c) {
@@ -6764,10 +6777,10 @@ static void run_cache_set(struct cache_set *c)
 		btree_journal_mark(c, &journal);
 
 		fill_heap();
-		c->journal.seq = j->seq;
 
 		c->journal.cur = c->journal.w;
-		btree_journal_next(c);
+		if (!fifo_full(&c->journal.pin))
+			btree_journal_next(c);
 		btree_journal_replay(c, &journal, &s);
 	} else {
 		printk(KERN_NOTICE "bcache: invalidating existing data\n");

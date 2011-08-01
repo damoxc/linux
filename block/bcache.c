@@ -4037,6 +4037,9 @@ static void btree_journal_alloc(struct cache_set *s)
 			? c->journal_end
 			: c->journal_area_end;
 		free -= c->journal_start;
+
+		free = min_t(unsigned, free, c->sb.bucket_size -
+			     c->journal_start % c->sb.bucket_size);
 		BUG_ON(!free);
 
 		s->journal.sectors_free = min(s->journal.sectors_free, free);

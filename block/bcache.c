@@ -5936,7 +5936,8 @@ static int register_dev_on_set(struct cache_set *c, struct cached_dev *d)
 
 	for (u = c->uuids; u < c->uuids + c->nr_uuids; u++)
 		if (!memcmp(u->uuid, d->sb.uuid, 16)) {
-			if (BDEV_STATE(&d->sb) != BDEV_STATE_STALE)
+			if (BDEV_STATE(&d->sb) != BDEV_STATE_STALE &&
+			    BDEV_STATE(&d->sb) != BDEV_STATE_NONE)
 				goto found;
 
 			memcpy(u->uuid, invalid_uuid, 16);

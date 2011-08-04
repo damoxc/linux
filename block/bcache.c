@@ -51,6 +51,8 @@
 
 /*
  * Todo:
+ * Sysfs var for how often priorities get written?
+ *
  * register_bcache: Return errors out to userspace correctly
  *
  * Writeback: don't undirty key until after a cache flush
@@ -131,11 +133,7 @@ static const char invalid_uuid[] = {
 	0xc8, 0x50, 0xfc, 0x5e, 0xcb, 0x16, 0xcd, 0x99
 };
 
-#define bucket_prio(i)		(((int) (i->prio - c->set->min_prio)) * i->mark)
-#define bucket_cmp(i, j)	(bucket_prio(i) >= bucket_prio(j))
-
 struct bucket {
-	long		heap;
 	atomic_t	pin;
 	uint16_t	prio;
 	uint8_t		gen;
@@ -320,8 +318,9 @@ struct gc_stat {
 	size_t			key_bytes;
 
 	size_t			nkeys;
-	uint64_t		data;
-	uint64_t		dirty;
+	uint64_t		data;	/* sectors */
+	uint64_t		dirty;	/* sectors */
+	unsigned		in_use; /* percent */
 };
 
 struct cache_set {
@@ -360,11 +359,11 @@ struct cache_set {
 	atomic_t		prio_blocked;
 	closure_list_t		bucket_wait;
 
-	unsigned		rescale_value;
 	atomic_t		rescale;
 	uint16_t		min_prio;
 	uint8_t			need_gc;
 	struct gc_stat		gc_stats;
+	size_t			nbuckets;
 
 	struct list_head	lru;
 	struct list_head	freed;
@@ -441,7 +440,7 @@ struct cache {
 
 	DECLARE_FIFO(long, free);
 	DECLARE_FIFO(long, free_inc);
-	DECLARE_FIFO(long, btree_freed);
+	DECLARE_FIFO(long, unused);
 
 	atomic_long_t		meta_sectors_written;
 	atomic_long_t		btree_sectors_written;
@@ -1358,18 +1357,6 @@ static void search_init_stack(struct search *s)
 
 /* Bucket heap / gen */
 
-__pure
-static inline unsigned in_use(const struct cache_set *s)
-{
-	struct cache *c;
-	uint64_t nbuckets = 0, heap = 0;
-
-	for_each_cache(c, s)
-		nbuckets += c->sb.nbuckets, heap += c->heap.size;
-
-	return div64_u64((nbuckets - heap) * 100, nbuckets);
-}
-
 #define bucket_gc_gen(b)	((uint8_t) ((b)->gen - (b)->last_gc))
 #define bucket_disk_gen(b)	((uint8_t) ((b)->gen - (b)->disk_gen))
 
@@ -1388,87 +1375,34 @@ static uint8_t inc_gen(struct cache *c, struct bucket *b)
 	return ret;
 }
 
-static void rescale_heap(struct cache_set *s, int sectors)
+static void rescale_heap(struct cache_set *c, int sectors)
 {
-	struct cache *c;
+	struct cache *ca;
 	struct bucket *b;
+	unsigned next = c->nbuckets * c->sb.bucket_size / 1024;
 	int r;
 
-	atomic_sub(sectors, &s->rescale);
+	atomic_sub(sectors, &c->rescale);
 
 	do {
-		r = atomic_read(&s->rescale);
+		r = atomic_read(&c->rescale);
 
 		if (r >= 0)
 			return;
-	} while (atomic_cmpxchg(&s->rescale, r, r + s->rescale_value) != r);
+	} while (atomic_cmpxchg(&c->rescale, r, r + next) != r);
 
-	spin_lock(&s->bucket_lock);
+	spin_lock(&c->bucket_lock);
 
-	for_each_cache(c, s)
-		for_each_bucket(b, c)
+	for_each_cache(ca, c)
+		for_each_bucket(b, ca)
 			if (b->prio &&
 			    b->prio != btree_prio &&
 			    !atomic_read(&b->pin)) {
 				b->prio--;
-				s->min_prio = min(s->min_prio, b->prio);
+				c->min_prio = min(c->min_prio, b->prio);
 			}
 
-	spin_unlock(&s->bucket_lock);
-}
-
-static inline void bucket_add_heap(struct cache *c, struct bucket *b)
-{
-	if (!b->mark)
-		b->prio = 0;
-
-	if (b->mark >= 0 &&
-	    bucket_gc_gen(b) < 96U) {
-		if (!b->mark &&
-		    bucket_disk_gen(b) < 64U &&
-		    fifo_push(&c->btree_freed, b - c->buckets))
-			atomic_inc(&b->pin);
-		else if (b->prio != btree_prio)
-			heap_add(&c->heap, b, heap, bucket_cmp);
-	}
-}
-
-static long pop_heap(struct cache *c)
-{
-	/* On cache hit, priority is increased but we don't readjust
-	 * the heap so as not to take the lock there - hence the heap
-	 * isn't necessarily a heap. This mostly works provided priority
-	 * only goes up - later we won't keep the full heap around
-	 * which will be better.
-	 */
-
-	while (1) {
-		struct bucket *b = heap_peek(&c->heap);
-
-		if (!b) {
-			queue_work(delayed, &c->set->gc_work);
-			printk_ratelimited(KERN_WARNING
-					   "bcache: heap empty!\n");
-			return -1;
-		}
-
-		heap_sift(&c->heap, 0, heap, bucket_cmp);
-		b = heap_pop(&c->heap, heap, bucket_cmp);
-
-		if (bucket_disk_gen(b) >= 96U)
-			continue;
-
-		inc_gen(c, b);
-
-		smp_mb();
-		if (atomic_read(&b->pin))
-			continue;
-
-		b->prio = initial_prio;
-		atomic_inc(&b->pin);
-
-		return b - c->buckets;
-	}
+	spin_unlock(&c->bucket_lock);
 }
 
 static long pop_freed(struct cache *c)
@@ -1477,7 +1411,7 @@ static long pop_freed(struct cache *c)
 
 	if ((!CACHE_SYNC(&c->set->sb) ||
 	     !atomic_read(&c->set->prio_blocked)) &&
-	    fifo_pop(&c->btree_freed, r))
+	    fifo_pop(&c->unused, r))
 		return r;
 
 	if ((!CACHE_SYNC(&c->set->sb) ||
@@ -1485,8 +1419,7 @@ static long pop_freed(struct cache *c)
 	    fifo_pop(&c->free_inc, r))
 		return r;
 
-	return  !CACHE_SYNC(&c->set->sb)
-		? pop_heap(c) : -1;
+	return -1;
 }
 
 /* Discard/TRIM */
@@ -1577,6 +1510,92 @@ static void do_discard(struct cache *c)
 
 /* Allocation */
 
+static void bucket_add_unused(struct cache *c, struct bucket *b)
+{
+	b->prio = 0;
+
+	if (bucket_gc_gen(b) < 96U &&
+	    bucket_disk_gen(b) < 64U &&
+	    fifo_push(&c->unused, b - c->buckets))
+		atomic_inc(&b->pin);
+}
+
+static void invalidate_buckets(struct cache *c)
+{
+	unsigned bucket_prio(struct bucket *b)
+	{
+		return ((unsigned) (b->prio - c->set->min_prio)) * b->mark;
+	}
+
+	bool bucket_max_cmp(struct bucket *l, struct bucket *r)
+	{
+		return bucket_prio(l) < bucket_prio(r);
+	}
+
+	bool bucket_min_cmp(struct bucket *l, struct bucket *r)
+	{
+		return bucket_prio(l) > bucket_prio(r);
+	}
+
+	struct bucket *b;
+	size_t pinned = 0, gc_gen = 0, disk_gen = 0;
+
+	if (!mutex_trylock(&c->set->gc_lock))
+		return;
+
+	if (bkey_cmp(&c->set->gc_done, &MAX_KEY))
+		goto out;
+
+	c->heap.used = 0;
+
+	for_each_bucket(b, c) {
+		if (atomic_read(&b->pin))
+			pinned++;
+		else if (bucket_gc_gen(b) >= 96U)
+			gc_gen++;
+		else if (bucket_disk_gen(b) >= 64U)
+			disk_gen++;
+		else if (!b->mark)
+			bucket_add_unused(c, b);
+		else if (b->mark > 0) {
+			if (!heap_full(&c->heap))
+				heap_add(&c->heap, b, bucket_max_cmp);
+			else if (bucket_max_cmp(b, heap_peek(&c->heap))) {
+				c->heap.data[0] = b;
+				heap_sift(&c->heap, 0, bucket_max_cmp);
+			}
+		}
+
+		if (fifo_full(&c->unused))
+			goto out;
+	}
+
+	if (c->heap.used * 2 < c->heap.size) {
+		queue_work(delayed, &c->set->gc_work);
+		pr_debug("heap %zu/%llu: pinned %zu gc_gen %zu disk_gen %zu",
+			 c->heap.used, c->sb.nbuckets,
+			 pinned, gc_gen, disk_gen);
+	}
+
+	for (ssize_t i = c->heap.used / 2 - 1; i >= 0; --i)
+		heap_sift(&c->heap, i, bucket_min_cmp);
+
+	while (!fifo_full(&c->free_inc) &&
+	       (b = heap_pop(&c->heap, bucket_min_cmp))) {
+		inc_gen(c, b);
+		smp_mb();
+
+		if (atomic_read(&b->pin))
+			continue;
+
+		b->prio = initial_prio;
+		atomic_inc(&b->pin);
+		fifo_push(&c->free_inc, b - c->buckets);
+	}
+out:
+	mutex_unlock(&c->set->gc_lock);
+}
+
 static void free_some_buckets(struct cache *c)
 {
 	long r;
@@ -1598,8 +1617,11 @@ static void free_some_buckets(struct cache *c)
 		atomic_dec_bug(&b->pin);
 	}
 
-	if (!CACHE_SYNC(&c->set->sb))
+	if (!CACHE_SYNC(&c->set->sb)) {
+		if (fifo_empty(&c->free_inc))
+			invalidate_buckets(c);
 		return;
+	}
 
 	/* XXX: tracepoint for when c->need_save_prio > 64 */
 
@@ -1607,22 +1629,15 @@ static void free_some_buckets(struct cache *c)
 	    (fifo_empty(&c->free_inc) ||
 	     c->need_save_prio > 64))
 		atomic_set(&c->prio_written, 0);
-	else if (atomic_read(&c->prio_written))
+
+	if (atomic_read(&c->prio_written) ||
+	    atomic_read(&c->set->prio_blocked))
 		return;
 
-	while (!fifo_full(&c->free_inc) &&
-	       ((r = pop_heap(c)) != -1))
-		fifo_push(&c->free_inc, r);
+	invalidate_buckets(c);
 
-	if (c->heap.size * 8 < c->sb.nbuckets)
-		queue_work(delayed, &c->set->gc_work);
-
-	if (atomic_read(&c->set->prio_blocked))
-		return;
-
-	if (fifo_full(&c->free_inc) ||
-	    c->need_save_prio > 64 ||
-	    (!c->heap.size && !fifo_empty(&c->free_inc)))
+	if (!fifo_empty(&c->free_inc) ||
+	    c->need_save_prio > 64)
 		prio_write(c, NULL);
 }
 
@@ -1647,11 +1662,10 @@ again:
 			BUG_ON(i == r);
 		fifo_for_each(i, &c->free_inc)
 			BUG_ON(i == r);
-		fifo_for_each(i, &c->btree_freed)
+		fifo_for_each(i, &c->unused)
 			BUG_ON(i == r);
 #endif
 		BUG_ON(atomic_read(&b->pin) != 1);
-		BUG_ON(b->heap != -1);
 
 		b->prio = priority;
 		b->mark = priority == btree_prio
@@ -1661,10 +1675,10 @@ again:
 	}
 
 	pr_debug("no free buckets, prio_written %i, blocked %i, "
-		 "free %zu, free_inc %zu, btree_freed %zu",
+		 "free %zu, free_inc %zu, unused %zu",
 		 atomic_read(&c->prio_written),
 		 atomic_read(&c->set->prio_blocked), fifo_used(&c->free),
-		 fifo_used(&c->free_inc), fifo_used(&c->btree_freed));
+		 fifo_used(&c->free_inc), fifo_used(&c->unused));
 
 	if (cl) {
 		if (test_bit(CLOSURE_BLOCK, &cl->flags))
@@ -1690,7 +1704,7 @@ static void unpop_bucket(struct cache_set *c, struct bkey *k)
 		struct bucket *b = PTR_BUCKET(c, k, i);
 
 		b->mark = 0;
-		bucket_add_heap(PTR_CACHE(c, k, i), b);
+		bucket_add_unused(PTR_CACHE(c, k, i), b);
 	}
 }
 
@@ -1774,7 +1788,10 @@ static const char *ptr_status(struct cache_set *c, const struct bkey *k)
 
 static bool __ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
 {
-	if (level && (!KEY_PTRS(k) || !KEY_SIZE(k)))
+	if (level && (!KEY_PTRS(k) || !KEY_SIZE(k) || KEY_DIRTY(k)))
+		goto bad;
+
+	if (!level && KEY_SIZE(k) > k->key)
 		goto bad;
 
 	if (!KEY_SIZE(k))
@@ -1835,7 +1852,8 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 			err = "btree";
 			if (KEY_DIRTY(k) ||
 			    g->prio != btree_prio ||
-			    g->heap != -1)
+			    (!bkey_cmp(&b->c->gc_done, &MAX_KEY) &&
+			     g->mark != GC_MARK_BTREE))
 				goto bug;
 		} else {
 			err = "data";
@@ -1843,16 +1861,18 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 				goto bug;
 
 			err = "dirty";
-			if (KEY_DIRTY(k) && g->heap != -1)
+			if (KEY_DIRTY(k) &&
+			    !bkey_cmp(&b->c->gc_done, &MAX_KEY) &&
+			    g->mark != GC_MARK_DIRTY)
 				goto bug;
 		}
 	}
 
 	return false;
 bug:
-	cache_bug(b, "inconsistent %s pointer %s: bucket %li heap %li pin %i "
+	cache_bug(b, "inconsistent %s pointer %s: bucket %li pin %i "
 		  "prio %i gen %i last_gc %i mark %i gc_gen %i", err, pkey(k),
-		  PTR_BUCKET_NR(b->c, k, i), g->heap, atomic_read(&g->pin),
+		  PTR_BUCKET_NR(b->c, k, i), atomic_read(&g->pin),
 		  g->prio, g->gen, g->last_gc, g->mark, g->gc_gen);
 	return true;
 }
@@ -2047,16 +2067,13 @@ static void fill_bucket_work(struct work_struct *w)
 		if (i != b->data && !i->keys)
 			goto err;
 
-		if (i->keys) {
-			cache_bug_on(bkey_cmp(&b->key, last_key(i)) < 0,
-				     b, "short btree key");
+		err = "short btree key";
+		if (i->keys && bkey_cmp(&b->key, last_key(i)) < 0)
+			goto err;
 
-			iter->top->k	= i->start;
-			iter->top->end	= end(i);
-
-			btree_iter_bubble(iter);
-			iter->top++;
-		}
+		iter->top->k	= i->start;
+		iter->top->end	= end(i);
+		btree_iter_push(iter);
 
 		b->written += set_blocks(i, b->c);
 	}
@@ -3091,32 +3108,6 @@ static void btree_sort_lazy(struct btree *b)
 		btree_sort(b, 0, NULL);
 }
 
-static void btree_mark_meta(struct cache_set *c)
-{
-	void mark_key(struct bkey *k)
-	{
-		for (unsigned i = 0; i < KEY_PTRS(k); i++)
-			PTR_BUCKET(c, k, i)->mark = GC_MARK_BTREE;
-	}
-
-	struct cache *ca;
-	uint64_t *i;
-
-	if (c->root)
-		mark_key(&c->root->key);
-
-	mark_key(&c->uuid_bucket);
-
-	for_each_cache(ca, c) {
-		for (i = ca->sb.d; i < ca->sb.d + ca->sb.keys; i++)
-			ca->buckets[*i].mark = GC_MARK_BTREE;
-
-		for (i = ca->prio_buckets;
-		     i < ca->prio_buckets + prio_buckets(ca) * 2; i++)
-			ca->buckets[*i].mark = GC_MARK_BTREE;
-	}
-}
-
 static void __btree_mark_key(struct cache_set *c, int level, struct bkey *k)
 {
 	if (!k->key)
@@ -3333,124 +3324,139 @@ static int btree_gc_root(struct btree *b, struct search *s, struct gc_stat *gc)
 	return ret;
 }
 
-static void set_gc_sectors(struct cache_set *s)
+static void set_gc_sectors(struct cache_set *c)
 {
-	struct cache *c;
-	uint64_t n = 0;
-	for_each_cache(c, s)
-		n += c->sb.nbuckets;
-
-	atomic_set(&s->sectors_to_gc, s->sb.bucket_size * n / 8);
+	atomic_set(&c->sectors_to_gc, c->sb.bucket_size * c->nbuckets / 8);
 }
 
-static unsigned btree_used(struct cache_set *c)
+static size_t btree_gc_finish(struct cache_set *c)
 {
-	uint64_t ret = c->gc_stats.key_bytes * 100;
-	return ret / ((c->gc_stats.nodes ?: 1) * btree_bytes(c));
+	void mark_key(struct bkey *k)
+	{
+		for (unsigned i = 0; i < KEY_PTRS(k); i++)
+			PTR_BUCKET(c, k, i)->mark = GC_MARK_BTREE;
+	}
+
+	size_t available = 0;
+	struct bucket *b;
+	struct cache *ca;
+	uint64_t *i;
+
+	spin_lock(&c->bucket_lock);
+
+	set_gc_sectors(c);
+	c->gc_done	= MAX_KEY;
+	c->need_gc	= 0;
+	c->min_prio	= initial_prio;
+
+	if (c->root)
+		mark_key(&c->root->key);
+
+	mark_key(&c->uuid_bucket);
+
+	for_each_cache(ca, c) {
+		for (i = ca->sb.d; i < ca->sb.d + ca->sb.keys; i++)
+			ca->buckets[*i].mark = GC_MARK_BTREE;
+
+		for (i = ca->prio_buckets;
+		     i < ca->prio_buckets + prio_buckets(ca) * 2; i++)
+			ca->buckets[*i].mark = GC_MARK_BTREE;
+
+		for_each_bucket(b, ca) {
+			cache_bug_on(c->journal.cur &&
+				     gen_after(b->last_gc, b->gc_gen), ca,
+				     "found old gen in gc");
+
+			b->last_gc	= b->gc_gen;
+			b->gc_gen	= b->gen;
+			c->need_gc	= max(c->need_gc, bucket_gc_gen(b));
+
+			if (!atomic_read(&b->pin) &&
+			    b->mark >= 0) {
+				available++;
+				if (!b->mark)
+					bucket_add_unused(ca, b);
+			}
+
+			if (b->prio)
+				c->min_prio = min(c->min_prio, b->prio);
+		}
+	}
+
+	spin_unlock(&c->bucket_lock);
+	return available;
 }
 
-static void btree_gc(struct cache_set *s)
+static void btree_gc(struct work_struct *w)
 {
+	struct cache_set *c = container_of(w, struct cache_set, gc_work);
 	int ret;
-	unsigned long pinned = 0, time = jiffies;
+	unsigned long available, time = jiffies;
 	struct gc_stat stats;
 	struct search sr;
 	struct bucket *b;
-	struct cache *c;
-	uint8_t need_gc = 0;
+	struct cache *ca;
 
 	search_init_stack(&sr);
 	closure_init_stack(&sr.cl);
 	sr.lock = SHORT_MAX;
 
-	memcpy(&stats, &s->gc_stats, sizeof(struct gc_stat));
-	stats.nodes = stats.key_bytes = stats.nkeys = 0;
-	stats.data = stats.dirty = 0;
+	memset(&stats, 0, sizeof(struct gc_stat));
 
-	spin_lock(&s->bucket_lock);
-	for_each_cache(c, s)
-		free_some_buckets(c);
-	spin_unlock(&s->bucket_lock);
+	spin_lock(&c->bucket_lock);
+	for_each_cache(ca, c)
+		free_some_buckets(ca);
+	spin_unlock(&c->bucket_lock);
 
-	if (!bkey_cmp(&s->gc_done, &KEY(0, 0, 0)))
-		for_each_cache(c, s)
-			for_each_bucket(b, c)
+	if (!mutex_trylock(&c->gc_lock))
+		return;
+
+	/* So pop_bucket() doesn't spin while we're blocking
+	 * invalidate_buckets()
+	 */
+	atomic_inc(&c->prio_blocked);
+
+	if (!bkey_cmp(&c->gc_done, &MAX_KEY)) {
+		c->gc_done = ZERO_KEY;
+
+		for_each_cache(ca, c)
+			for_each_bucket(b, ca)
 				if (!atomic_read(&b->pin))
 					b->mark = 0;
+	}
 
-	ret = btree_root(gc_root, s, &sr, &stats);
+	ret = btree_root(gc_root, c, &sr, &stats);
 	closure_sync(&sr.insert);
 	closure_sync(&sr.cl);
 
 	if (ret) {
 		printk(KERN_WARNING "bcache: gc failed!\n");
-		queue_work(delayed, &s->gc_work);
-		return;
+		queue_work(delayed, &c->gc_work);
+		goto out;
 	}
-
-	s->gc_done = KEY(0, 0, 0);
-	set_gc_sectors(s);
 
 	/* Possibly wait for new UUIDs or whatever to hit disk */
-	btree_journal_wait(s, &sr.insert);
+	btree_journal_wait(c, &sr.insert);
 	closure_sync(&sr.insert);
 
-	spin_lock(&s->bucket_lock);
-	swap(need_gc, s->need_gc);
-
-	btree_mark_meta(s);
-
-	s->min_prio = initial_prio;
-
-	for_each_cache(c, s) {
-		c->heap.size = 0;
-
-		for_each_bucket(b, c) {
-			cache_bug_on(gen_after(b->last_gc, b->gc_gen), c,
-				     "found old gen in gc");
-
-			b->heap		= -1;
-			b->last_gc	= b->gc_gen;
-			b->gc_gen	= b->gen;
-			s->need_gc	= max(s->need_gc, bucket_gc_gen(b));
-
-			if (b->prio)
-				s->min_prio = min(s->min_prio, b->prio);
-
-			if (!atomic_read(&b->pin))
-				bucket_add_heap(c, b);
-			else
-				pinned++;
-		}
-	}
-
-	spin_unlock(&s->bucket_lock);
+	available = btree_gc_finish(c);
 
 	time = jiffies_to_msecs(jiffies - time);
 
-	stats.count++;
-	stats.ms_max	= max_t(unsigned, stats.ms_max, time);
+	stats.count	= c->gc_stats.count + 1;
+	stats.ms_max	= max_t(unsigned, c->gc_stats.ms_max, time);
 	stats.last	= get_seconds();
 
 	stats.key_bytes *= sizeof(uint64_t);
 	stats.dirty	<<= 9;
 	stats.data	<<= 9;
-	memcpy(&s->gc_stats, &stats, sizeof(struct gc_stat));
-
-	pr_debug("gc took %lu ms, %li pinned, %i%% used, %zu btree "
-		 "nodes %i%% used, need_gc was %i now %i", time, pinned,
-		 in_use(s), stats.nodes, btree_used(s), need_gc, s->need_gc);
-}
-
-static void btree_gc_work(struct work_struct *w)
-{
-	struct cache_set *c = container_of(w, struct cache_set, gc_work);
-
-	if (!mutex_trylock(&c->gc_lock))
-		return;
-
-	btree_gc(c);
+	stats.in_use	= (c->nbuckets - available) * 100 / c->nbuckets;
+	memcpy(&c->gc_stats, &stats, sizeof(struct gc_stat));
+out:
 	mutex_unlock(&c->gc_lock);
+
+	atomic_dec(&c->prio_blocked);
+	closure_run_wait(&c->bucket_wait, delayed);
 }
 
 /* Btree insertion */
@@ -3836,12 +3842,12 @@ static void __btree_insert_async(struct search *s, struct cache_set *c)
 	keylist_init(&s->keys);
 
 	while (c->need_gc > MAX_NEED_GC) {
+		/* XXX: maybe use a wait list? */
 		mutex_lock(&c->gc_lock);
+		mutex_unlock(&c->gc_lock);
 
 		if (c->need_gc > MAX_NEED_GC)
-			btree_gc(c);
-
-		mutex_unlock(&c->gc_lock);
+			btree_gc(&c->gc_work);
 	}
 
 	for_each_cache(ca, c)
@@ -4198,10 +4204,9 @@ static void btree_journal_alloc(struct cache_set *s)
 		s->journal.sectors_free = min(s->journal.sectors_free, free);
 	}
 
-	if (!n)
-		printk(KERN_NOTICE "bcache: journal filled up\n");
-	else
+	if (n)
 		closure_run_wait(&w->c->journal.wait, delayed);
+
 	w->key.header = KEY_HEADER(0, 0);
 	SET_KEY_PTRS(&w->key, n);
 }
@@ -4637,7 +4642,7 @@ again:
 	r = btree_root(refill_dirty, d->c, &s, &count);
 
 	pr_debug("found %i keys on %i from %llu to %llu, %i%% used",
-		 count, d->id, l, d->last_found, in_use(d->c));
+		 count, d->id, l, d->last_found, d->c->gc_stats.in_use);
 
 	if (!r && count < WRITEBACK_SLURP) {
 		/* Got to the end of the btree */
@@ -4697,7 +4702,7 @@ static bool should_refill_dirty(struct cached_dev *d)
 	return t &&
 		((d->writeback_running &&
 		  ((jiffies_to_msecs(jiffies - t) > ms &&
-		    in_use(d->c) > d->writeback_percent) ||
+		    d->c->gc_stats.in_use > d->writeback_percent) ||
 		   !d->writeback)) ||
 		 atomic_read(&d->closing));
 }
@@ -4996,7 +5001,7 @@ static void bio_insert(struct closure *cl)
 		struct bkey *k;
 
 		if (keylist_realloc(&s->keys, 1))
-			return_f(&s->insert, btree_journal);
+			return_f(cl, btree_journal);
 
 		k = s->keys.top;
 
@@ -5012,18 +5017,18 @@ static void bio_insert(struct closure *cl)
 		n = bio_split_c(bio, KEY_SIZE(k), s->d->c);
 		if (!n) {
 			__bkey_put(s->d->c, k);
-			return_f(&s->insert, bio_insert);
+			return_f(cl, bio_insert);
 		}
 
 		if (n != bio) {
-			closure_get(&s->insert);
+			closure_get(cl);
 			n->bi_rw &= ~REQ_UNPLUG;
 		}
 
 		pr_debug("%s", pkey(k));
 		keylist_push(&s->keys);
 
-		s->insert.fn = btree_journal;
+		cl->fn = btree_journal;
 
 		n->bi_rw	|= WRITE;
 		n->bi_sector	 = PTR_OFFSET(k, 0);
@@ -5172,7 +5177,7 @@ static void check_should_skip(struct search *s)
 	unsigned avg;
 
 	if (atomic_read(&s->d->closing) ||
-	    in_use(s->d->c) > CUTOFF_CACHE_ADD)
+	    s->d->c->gc_stats.in_use > CUTOFF_CACHE_ADD)
 		goto skip;
 
 	if (s->bio->bi_sector   % s->d->c->sb.block_size ||
@@ -5269,7 +5274,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 	if (sectors < 0 ||
 	    bio_rw_flagged(last_bio, BIO_RW_AHEAD) ||
 	    bio_rw_flagged(last_bio, BIO_RW_META) ||
-	    in_use(s->d->c) > CUTOFF_CACHE_READA)
+	    s->d->c->gc_stats.in_use > CUTOFF_CACHE_READA)
 		sectors = 0;
 	else
 		sectors = min(sectors, pages);
@@ -5386,7 +5391,7 @@ skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
 	}
 
 	if (s->d->writeback) {
-		int i = in_use(s->d->c);
+		int i = s->d->c->gc_stats.in_use;
 		if (i < CUTOFF_WRITEBACK ||
 		    (i < CUTOFF_WRITEBACK_SYNC && s->bio->bi_rw & REQ_SYNC))
 			s->insert_type = INSERT_WRITEBACK;
@@ -5462,7 +5467,7 @@ read_attribute(root_usage_percent);
 read_attribute(priority_stats);
 read_attribute(btree_cache_size);
 read_attribute(btree_cache_max_chain);
-read_attribute(heap_size);
+read_attribute(cache_available_percent);
 read_attribute(written);
 read_attribute(btree_written);
 read_attribute(metadata_written);
@@ -5510,9 +5515,7 @@ static int btree_check(struct btree *b, struct search *s)
 					g->prio = btree_prio;
 				else if (g->prio == btree_prio)
 					g->prio = initial_prio;
-			} else
-				cache_bug_on(KEY_DIRTY(k) && KEY_SIZE(k),
-					     b, "stale dirty pointer");
+			}
 		}
 
 		btree_mark_key(b, k);
@@ -6002,7 +6005,7 @@ static void prio_write_done(struct closure *cl)
 {
 	struct cache *c = container_of(cl, struct cache, prio);
 	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
-		 fifo_used(&c->free_inc), fifo_used(&c->btree_freed));
+		 fifo_used(&c->free_inc), fifo_used(&c->unused));
 
 	spin_lock(&c->set->bucket_lock);
 
@@ -6059,6 +6062,7 @@ static void prio_write_bucket(struct closure *cl)
 static void prio_write(struct cache *c, struct closure *cl)
 {
 	BUG_ON(c->prio_alloc != prio_buckets(c));
+	BUG_ON(atomic_read(&c->prio_written));
 
 	for (struct bucket *b = c->buckets;
 	     b < c->buckets + c->sb.nbuckets; b++)
@@ -6077,7 +6081,7 @@ static void prio_write(struct cache *c, struct closure *cl)
 	closure_put(&c->prio, system_wq);
 
 	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
-		 fifo_used(&c->free_inc), fifo_used(&c->btree_freed));
+		 fifo_used(&c->free_inc), fifo_used(&c->unused));
 }
 
 static int prio_read(struct cache *c, uint64_t bucket)
@@ -6731,6 +6735,12 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 		return ret;
 	}
 
+	unsigned btree_used(struct cache_set *c)
+	{
+		return div64_u64(c->gc_stats.key_bytes * 100,
+				 (c->gc_stats.nodes ?: 1) * btree_bytes(c));
+	}
+
 	sysfs_print(synchronous,	"%i", (int) CACHE_SYNC(&c->sb));
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
@@ -6742,6 +6752,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 
 	sysfs_hprint(btree_cache_size,	cache_size(c));
 	sysfs_print(btree_cache_max_chain, "%u", cache_max_chain(c));
+	sysfs_print(cache_available_percent, "%u", 100 - c->gc_stats.in_use);
 
 	sysfs_print(average_seconds_between_gc, "%li",
 		    DIV_SAFE(get_seconds() - c->sb.last_mount,
@@ -6969,7 +6980,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	mutex_init(&c->sb_write);
 
 	INIT_WORK(&c->unregister, unregister_cache_set_work);
-	INIT_WORK(&c->gc_work, btree_gc_work);
+	INIT_WORK(&c->gc_work, btree_gc);
 	INIT_WORK(&c->journal.work, btree_journal_work);
 	INIT_LIST_HEAD(&c->devices);
 	INIT_LIST_HEAD(&c->lru);
@@ -7030,30 +7041,6 @@ err:
 
 static void run_cache_set(struct cache_set *c)
 {
-	void fill_heap(void)
-	{
-		struct bucket *b;
-		struct cache *ca;
-
-		btree_mark_meta(c);
-
-		c->min_prio = initial_prio;
-
-		for_each_cache(ca, c)
-			for_each_bucket(b, ca) {
-				b->last_gc = b->gc_gen;
-				c->need_gc = max(c->need_gc, bucket_gc_gen(b));
-
-				if (b->prio)
-					c->min_prio = min(c->min_prio, b->prio);
-			}
-
-		for_each_cache(ca, c)
-			for_each_bucket(b, ca)
-				if (!atomic_read(&b->pin))
-					bucket_add_heap(ca, b);
-	}
-
 	const char *err = "cannot allocate memory";
 	struct cached_dev *d, *t;
 	struct cache *ca;
@@ -7061,8 +7048,7 @@ static void run_cache_set(struct cache_set *c)
 	search_init_stack(&s);
 
 	for_each_cache(ca, c)
-		c->rescale_value += bucket_to_sector(c, ca->sb.nbuckets) / 2048;
-	set_gc_sectors(c);
+		c->nbuckets += ca->sb.nbuckets;
 
 	if (CACHE_SYNC(&c->sb)) {
 		LIST_HEAD(journal);
@@ -7116,7 +7102,7 @@ static void run_cache_set(struct cache_set *c)
 
 		btree_journal_mark(c, &journal);
 
-		fill_heap();
+		btree_gc_finish(c);
 
 		c->journal.cur = c->journal.w;
 		if (!fifo_full(&c->journal.pin))
@@ -7124,6 +7110,8 @@ static void run_cache_set(struct cache_set *c)
 		btree_journal_replay(c, &journal, &s);
 	} else {
 		printk(KERN_NOTICE "bcache: invalidating existing data\n");
+		/* Don't want invalidate_buckets() to queue a gc yet */
+		mutex_lock(&c->gc_lock);
 
 		for_each_cache(ca, c) {
 			ca->sb.keys = clamp_t(int, ca->sb.nbuckets / 100,
@@ -7135,7 +7123,7 @@ static void run_cache_set(struct cache_set *c)
 			cache_init_journal(ca);
 		}
 
-		fill_heap();
+		btree_gc_finish(c);
 
 		err = "cannot allocate new UUID bucket";
 		if (uuid_write(c))
@@ -7165,6 +7153,7 @@ static void run_cache_set(struct cache_set *c)
 		c->journal.cur = c->journal.w;
 		btree_journal_next(c);
 		btree_journal_meta(c, &s.insert);
+		mutex_unlock(&c->gc_lock);
 	}
 
 	closure_sync(&s.insert);
@@ -7199,6 +7188,7 @@ static const char *register_cache_set(struct cache *c)
 		&sysfs_btree_avg_keys_written,
 		&sysfs_btree_cache_size,
 		&sysfs_btree_cache_max_chain,
+		&sysfs_cache_available_percent,
 
 		&sysfs_average_seconds_between_gc,
 		&sysfs_gc_ms_max,
@@ -7303,7 +7293,6 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
 	sysfs_print(nbuckets,		"%lli", c->sb.nbuckets);
-	sysfs_print(heap_size,		"%zu", c->heap.size);
 	sysfs_print(discard,		"%i", c->discard);
 	sysfs_hprint(written, atomic_long_read(&c->sectors_written) << 9);
 	sysfs_hprint(btree_written,
@@ -7412,7 +7401,7 @@ static void free_cache(struct kobject *k)
 
 	free_heap(&c->heap);
 	free_fifo(&c->journal);
-	free_fifo(&c->btree_freed);
+	free_fifo(&c->unused);
 	free_fifo(&c->free_inc);
 	free_fifo(&c->free);
 
@@ -7433,7 +7422,6 @@ static int register_cache_kobj(struct cache *c)
 		&sysfs_block_size,
 		&sysfs_nbuckets,
 		&sysfs_priority_stats,
-		&sysfs_heap_size,
 		&sysfs_discard,
 		&sysfs_written,
 		&sysfs_btree_written,
@@ -7469,7 +7457,7 @@ static void cache_init_journal(struct cache *c)
 
 static struct cache *alloc_cache(struct cache_sb *sb)
 {
-	unsigned free;
+	size_t free;
 	struct bucket *b;
 	struct cache *c = kzalloc(sizeof(struct cache), GFP_KERNEL);
 	if (!c)
@@ -7487,14 +7475,15 @@ static struct cache *alloc_cache(struct cache_sb *sb)
 	c->journal_bio.bi_max_vecs = 8;
 	c->journal_bio.bi_io_vec = c->journal_bio.bi_inline_vecs;
 
-	free = max_t(unsigned, c->sb.nbuckets >> 11, 16);
-	free = max_t(unsigned, prio_buckets(c) + 4, free);
+	free = roundup_pow_of_two(c->sb.nbuckets) >> 9;
+	free = max_t(size_t, free, 16);
+	free = max_t(size_t, free, prio_buckets(c) + 4);
 
-	if (!init_fifo(&c->btree_freed,	free, GFP_KERNEL) ||
+	if (!init_fifo(&c->journal,	JOURNAL_PIN, GFP_KERNEL) ||
+	    !init_fifo(&c->unused,	free, GFP_KERNEL) ||
 	    !init_fifo(&c->free,	free, GFP_KERNEL) ||
 	    !init_fifo(&c->free_inc,	free << 2, GFP_KERNEL) ||
-	    !init_fifo(&c->journal,	JOURNAL_PIN, GFP_KERNEL) ||
-	    !init_heap(&c->heap,	c->sb.nbuckets, GFP_KERNEL) ||
+	    !init_heap(&c->heap,	free << 3, GFP_KERNEL) ||
 	    !(c->discard_page	= alloc_page(__GFP_ZERO|GFP_KERNEL)) ||
 	    !(c->buckets	= vmalloc(sizeof(struct bucket) *
 					  c->sb.nbuckets)) ||
@@ -7508,10 +7497,8 @@ static struct cache *alloc_cache(struct cache_sb *sb)
 	c->prio_next = c->prio_buckets + prio_buckets(c);
 
 	memset(c->buckets, 0, c->sb.nbuckets * sizeof(struct bucket));
-	for_each_bucket(b, c) {
+	for_each_bucket(b, c)
 		atomic_set(&b->pin, 0);
-		b->heap = -1;
-	}
 
 	for (int i = 0; i < 8; i++) {
 		struct discard *d = kzalloc(sizeof(*d), GFP_KERNEL);

@@ -44,120 +44,90 @@ static inline void SET_##name(type *k, uint64_t v)		\
 
 #define DECLARE_HEAP(type, name)					\
 	struct {							\
-		size_t size, heap_size;					\
+		size_t size, used;					\
 		type *data;						\
 	} name
 
 #define DEFINE_HEAP(type, name, s)					\
 	struct {							\
 		size_t size;						\
-		const size_t heap_size;					\
+		const size_t used;					\
 		type data[s];						\
-	} name = { .size = 0, .heap_size = s }
-
-#define heap_for_each(c, heap)						\
-	for (size_t _i = 0; c = (heap)->data[_i], _i < (heap)->size; _i++)
+	} name = { .used = 0, .size = s }
 
 #define init_heap(h, s, gfp)						\
 ({									\
-	(h)->size = 0;							\
-	(h)->heap_size = s;						\
-	if ((h)->heap_size * sizeof(*(h)->data) >= KMALLOC_MAX_SIZE)	\
-		(h)->data = vmalloc(s * sizeof(*(h)->data));		\
-	else if (s > 0)							\
-		(h)->data = kmalloc(s * sizeof(*(h)->data), gfp);	\
+	(h)->used = 0;							\
+	(h)->size = s;							\
+	if ((h)->size * sizeof(*(h)->data) >= KMALLOC_MAX_SIZE)		\
+		(h)->data = vmalloc((h)->size * sizeof(*(h)->data));	\
+	else if ((h)->size > 0)						\
+		(h)->data = kmalloc((h)->size * sizeof(*(h)->data), gfp);\
 	(h)->data;							\
 })
 
 #define free_heap(h)							\
 do {									\
-	if ((h)->heap_size * sizeof(*(h)->data) >= KMALLOC_MAX_SIZE)	\
+	if ((h)->size * sizeof(*(h)->data) >= KMALLOC_MAX_SIZE)		\
 		vfree((h)->data);					\
 	else								\
 		kfree((h)->data);					\
 } while (0)
 
-#define heap_swap(h, i, j, member)					\
-do {									\
-	swap((h)->data[i], (h)->data[j]);				\
-	(h)->data[i]->member = i;					\
-	(h)->data[j]->member = j;					\
-} while (0)
+#define heap_swap(h, i, j)	swap((h)->data[i], (h)->data[j])
 
-#define heap_sift(h, i, member, cmp)					\
+#define heap_sift(h, i, cmp)						\
 do {									\
-	long _r, _j = i;						\
+	size_t _r, _j = i;						\
 									\
-	for (; _j * 2 + 1 < (h)->size; _j = _r) {			\
+	for (; _j * 2 + 1 < (h)->used; _j = _r) {			\
 		_r = _j * 2 + 1;					\
-		if (_r + 1 < (h)->size &&				\
+		if (_r + 1 < (h)->used &&				\
 		    cmp((h)->data[_r], (h)->data[_r + 1]))		\
 			_r++;						\
 									\
 		if (cmp((h)->data[_r], (h)->data[_j]))			\
 			break;						\
-		heap_swap(h, _r, _j, member);				\
+		heap_swap(h, _r, _j);					\
 	}								\
 } while (0)
 
-#define heap_sift_down(h, i, member, cmp)				\
+#define heap_sift_down(h, i, cmp)					\
 do {									\
 	while (i) {							\
-		long p = (i - 1) / 2;					\
+		size_t p = (i - 1) / 2;					\
 		if (cmp((h)->data[i], (h)->data[p]))			\
 			break;						\
-		heap_swap(h, i, p, member);				\
+		heap_swap(h, i, p);					\
 		i = p;							\
 	}								\
 } while (0)
 
-#define heap_add(h, d, member, cmp)					\
+#define heap_add(h, d, cmp)						\
 do {									\
-	long _i = (d)->member;						\
+	size_t _i = (h)->used++;					\
+	(h)->data[_i]  = d;						\
 									\
-	if (_i == -1) {							\
-		_i = (h)->size++;					\
-		(h)->data[_i]  = d;					\
-		(d)->member = _i;					\
-	}								\
-									\
-	heap_sift_down(h, _i, member, cmp);				\
-	heap_sift(h, _i, member, cmp);					\
+	heap_sift_down(h, _i, cmp);					\
+	heap_sift(h, _i, cmp);						\
 } while (0)
 
-#define heap_pop(h, member, cmp)					\
+#define heap_pop(h, cmp)						\
 ({									\
-	typeof((h)->data[0]) _r = (h)->data[0];				\
+	typeof((h)->data[0]) _r = NULL;					\
 									\
 	if ((h)->size) {						\
-		(h)->size--;						\
-		heap_swap(h, 0, (h)->size, member);			\
-		heap_sift(h, 0, member, cmp);				\
-		(h)->data[(h)->size] = NULL;				\
-		_r->member = -1;					\
-	} else								\
-		_r = NULL;						\
+		_r = (h)->data[0];					\
+		(h)->used--;						\
+		heap_swap(h, 0, (h)->used);				\
+		heap_sift(h, 0, cmp);					\
+	}								\
 	_r;								\
 })
 
-#define heap_remove(h, d, member, cmp)					\
-do {									\
-	long _i = (d)->member;						\
-									\
-	if (_i == -1)							\
-		break;							\
-									\
-	if (_i != --((h)->size)) {					\
-		heap_swap(h, _i, (h)->size, member);			\
-		heap_sift_down(h, _i, member, cmp);			\
-		heap_sift(h, _i, member, cmp);				\
-	}								\
-									\
-	(h)->data[(h)->size] = NULL;					\
-	(d)->member = -1;						\
-} while (0)
-
 #define heap_peek(h)	((h)->size ? (h)->data[0] : NULL)
+
+#define heap_full(h)	((h)->used == (h)->size)
 
 #define DECLARE_FIFO(type, name)					\
 	struct {							\

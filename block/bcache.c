@@ -590,9 +590,16 @@ struct btree {
 	BKEY_PADDED(key);
 
 	union {
-		struct bset		*data;
-		struct bset		*sets[8];
+		struct bset	*data;
+		struct bset	*sets[4];
 	};
+
+#define BSET_TREE_SIZE	63
+	struct bset_tree {
+		struct bkey	key[BSET_TREE_SIZE];
+		unsigned	m[BSET_TREE_SIZE];
+	}			tree[4];
+
 	struct bio		bio;
 };
 
@@ -709,6 +716,7 @@ static void btree_journal_wait(struct cache_set *, struct closure *);
 static inline void cached_dev_put(struct cached_dev *);
 static void cache_init_journal(struct cache *);
 static struct cache_set *alloc_cache_set(struct cache_sb *);
+static void bkey_copy_key(struct bkey *, const struct bkey *);
 
 #define btree_prio		((uint16_t) ~0)
 #define MAX_NEED_GC		64
@@ -937,30 +945,94 @@ static struct bkey *prev(const struct bkey *k)
 	return (struct bkey *) d;
 }
 
+/* Bset binary search */
+
+static unsigned bset_middle(struct bset *i, unsigned l, unsigned r)
+{
+	unsigned m = (l + r) >> 1;
+	while (!KEY_IS_HEADER(node(i, m)))
+		m--;
+
+	if (m == l && next(node(i, m)) != node(i, r))
+		m += 2 + KEY_PTRS(node(i, m));
+
+	return m;
+}
+
 __pure
-static struct bkey *btree_bsearch(struct bset *i, const struct bkey *search)
+static struct bkey *__btree_bsearch(struct bset *i, const struct bkey *search,
+				    unsigned l, unsigned r)
 {
 	/* Returns the smallest key greater than the search key.
 	 * This is because we index by the end, not the beginning
 	 */
-	int l = 0, r = i->keys;
+	while (l < r) {
+		unsigned m = bset_middle(i, l, r);
 
-	if (search)
-		while (l < r) {
-			int m = (l + r) >> 1;
-			while (!KEY_IS_HEADER(node(i, m)))
-				m--;
-
-			if (m == l && next(node(i, m)) != node(i, r))
-				m += 2 + KEY_PTRS(node(i, m));
-
-			if (bkey_cmp(node(i, m), search) > 0)
-				r = m;
-			else
-				l = m + 2 + KEY_PTRS(node(i, m));
-		}
+		if (bkey_cmp(node(i, m), search) > 0)
+			r = m;
+		else
+			l = m + 2 + KEY_PTRS(node(i, m));
+	}
 
 	return node(i, l);
+}
+
+inline
+static struct bkey *btree_bsearch(struct bset *i, const struct bkey *search)
+{
+	return search ? __btree_bsearch(i, search, 0, i->keys) : i->start;
+}
+
+static void bset_build_tree(struct btree *b, unsigned set)
+{
+	struct bset *i		= b->sets[set];
+	struct bset_tree *t	= &b->tree[set];
+
+	void recurse(unsigned j, unsigned l, unsigned r)
+	{
+		if (j >= BSET_TREE_SIZE)
+			return;
+
+		if (l == r) {
+			t->m[j] = l;
+			if (l == i->keys)
+				bkey_copy_key(&t->key[j], &MAX_KEY);
+			else
+				bkey_copy_key(&t->key[j], node(i, t->m[j]));
+		} else {
+			t->m[j] = bset_middle(i, l, r);
+			bkey_copy_key(&t->key[j], node(i, t->m[j]));
+		}
+
+		recurse(j * 2 + 1,	l, t->m[j]);
+		recurse(j * 2 + 2,	t->m[j], r);
+
+	}
+	BUG_ON(set >= 4);
+
+	recurse(0, 0, i->keys);
+}
+
+static struct bkey *btree_bsearch_tree(struct btree *b, unsigned set,
+				       const struct bkey *search)
+{
+	struct bset *i		= b->sets[set];
+	struct bset_tree *t	= &b->tree[set];
+
+	unsigned j = 0, l = 0, r = i->keys;
+
+	while (j < BSET_TREE_SIZE) {
+		if (bkey_cmp(&t->key[j], search) > 0) {
+			r = t->m[j];
+			j = j * 2 + 1;
+		} else {
+			l = t->m[j];
+			j = j * 2 + 2;
+		}
+	}
+
+	return __btree_bsearch(i, search, l, r);
 }
 
 /* Btree iterator */
@@ -995,23 +1067,48 @@ static void btree_iter_bubble(struct btree_iter *iter)
 	__btree_iter_bubble(iter, iter->top);
 }
 
-static struct bkey *btree_iter_init(struct btree *b, struct btree_iter *iter,
-				    struct bkey *search, int start)
+static void btree_iter_push(struct btree_iter *iter)
 {
-	struct bkey *ret = NULL;
+	if (iter->top->k != iter->top->end) {
+		btree_iter_bubble(iter);
+		iter->top++;
+	}
+}
+
+static void btree_iter_init_nosearch(struct btree *b, struct btree_iter *iter,
+				     int start)
+{
 	struct bset *i;
 	iter->top = iter->sets;
 
 	for_each_sorted_set_start(b, i, start) {
-		iter->top->k	= btree_bsearch(i, search);
+		iter->top->k	= i->start;
 		iter->top->end	= end(i);
-		ret = iter->top->k;
 
-		if (iter->top->k != iter->top->end) {
-			btree_iter_bubble(iter);
-			iter->top++;
-		}
+		btree_iter_push(iter);
 	}
+
+	iter->top--;
+}
+
+static struct bkey *btree_iter_init(struct btree *b, struct btree_iter *iter,
+				    struct bkey *search)
+{
+	int i = b->nsets;
+	struct bkey *ret = NULL;
+	iter->top = iter->sets;
+
+	if (b->sets[i] == write_block(b)) {
+		iter->top->k = ret = btree_bsearch(b->sets[i], search);
+		goto start;
+	}
+
+	do {
+		iter->top->k	= btree_bsearch_tree(b, i, search);
+start:		iter->top->end	= end(b->sets[i]);
+
+		btree_iter_push(iter);
+	} while (--i >= 0);
 
 	iter->top--;
 	return ret;
@@ -1762,17 +1859,25 @@ bug:
 
 static struct bkey *next_recurse_key(struct btree *b, struct bkey *search)
 {
+	int i = b->nsets;
 	struct bkey *k, *ret = NULL;
 
-	for_each_key_after_filter(b, k, search, ptr_bad) {
-		if (!ret || bkey_cmp(k, ret) < 0)
-			ret = k;
-		/* We're actually in two loops here, looping over the sorted
-		 * sets and then the keys within each set - break out of the
-		 * inner loop and still loop over the sorted sets
-		 */
-		break;
+	if (b->sets[i] == write_block(b)) {
+		k = btree_bsearch(b->sets[i], search);
+		goto start;
 	}
+
+	do {
+		k = btree_bsearch_tree(b, i, search);
+start:
+		for (; k < end(b->sets[i]);
+		     k = next(k))
+			if (!ptr_bad(b, k)) {
+				if (!ret || bkey_cmp(k, ret) < 0)
+					ret = k;
+				break;
+			}
+	} while (--i >= 0);
 
 	return ret;
 }
@@ -2147,6 +2252,10 @@ err:		closure_init_stack(&wait);
 	}
 
 	pr_debug("%s block %i keys %i", pbtree(b), b->written, i->keys);
+
+	BUG_ON(b->sets[b->nsets] != write_block(b));
+	bset_build_tree(b, b->nsets);
+	smp_wmb();
 
 	b->written += set_blocks(i, b->c);
 	atomic_long_add(set_blocks(i, b->c) * b->c->sb.block_size,
@@ -2721,7 +2830,7 @@ static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 {
 	struct bio *n;
 	struct btree_iter iter;
-	btree_iter_init(b, &iter, &SEARCH(s), 0);
+	btree_iter_init(b, &iter, &SEARCH(s));
 
 	while (1) {
 		struct bkey *k = btree_iter_next(&iter);
@@ -2942,6 +3051,8 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 	else
 		free_pages((unsigned long) out, order);
 
+	bset_build_tree(b, start);
+
 	pr_debug("sorted %i keys", b->sets[start]->keys);
 	check_key_order(b, b->sets[start]);
 	BUG_ON(!fixup && b->written && count_data(b) < oldsize);
@@ -2950,14 +3061,14 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 static void btree_sort(struct btree *b, int start, struct bset *new)
 {
 	struct btree_iter iter;
-	btree_iter_init(b, &iter, NULL, start);
+	btree_iter_init_nosearch(b, &iter, start);
 
 	__btree_sort(b, start, new, &iter, false);
 }
 
 static void btree_sort_lazy(struct btree *b)
 {
-	if (b->nsets > 1) {
+	if (b->nsets) {
 		struct bset *i;
 		unsigned keys = 0, total;
 
@@ -3365,7 +3476,17 @@ static void shift_keys(struct bset *i, struct bkey *where, struct bkey *insert)
 static bool check_old_keys(struct btree *b, struct bkey *k,
 			   struct btree_iter *iter, struct search *s)
 {
+	void rebuild(struct bkey *j)
+	{
+		for (int i = 0; i < b->nsets; i++)
+			if (j < end(b->sets[i])) {
+				bset_build_tree(b, i);
+				return;
+			}
+	}
+
 	bool overwrote = false;
+	struct bset *w = write_block(b);
 
 	while (1) {
 		struct bkey *j = btree_iter_next(iter);
@@ -3393,34 +3514,49 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 			    memcmp(&j->key, &k->key, key_bytes(k) - 8))
 				goto wb_failed;
 
-			cut_back(&START_KEY(k), j);
+			if (j < w->start)
+				cut_front(k, j);
+			else
+				cut_back(&START_KEY(k), j);
 			atomic_long_inc(&b->c->writeback_keys_done);
 			return false;
 		}
 
 		if (bkey_cmp(k, j) < 0) {
 			if (bkey_cmp(&START_KEY(k), &START_KEY(j)) > 0) {
-				struct bset *w = write_block(b);
 				struct bkey *m = j;
 
 				if (j < w->start) {
 					m = btree_bsearch(w, k);
 					shift_keys(w, m, j);
+
+					cut_back(&START_KEY(k), j);
+					rebuild(j);
 				} else {
 					BKEY_PADDED(key) temp;
 					bkey_copy(&temp.key, j);
 					shift_keys(w, m, &temp.key);
 					m = next(j);
+
+					cut_back(&START_KEY(k), j);
 				}
 
 				cut_front(k, m);
-				cut_back(&START_KEY(k), j);
 				return false;
 			}
 
 			cut_front(k, j);
-		} else
-			__cut_back(&START_KEY(k), j);
+		} else {
+			if (j >= w->start)
+				__cut_back(&START_KEY(k), j);
+			else if (!bkey_cmp(k, j) &&
+				 bkey_cmp(&START_KEY(k), &START_KEY(j)) <= 0)
+				cut_front(k, j);
+			else {
+				__cut_back(&START_KEY(k), j);
+				rebuild(j);
+			}
+		}
 
 		overwrote = true;
 	}
@@ -3488,7 +3624,7 @@ copy:
 
 		if (!b->level) {
 			struct btree_iter iter;
-			m = btree_iter_init(b, &iter, &START_KEY(k), 0);
+			m = btree_iter_init(b, &iter, &START_KEY(k));
 
 			BUG_ON(!m || m < i->start);
 
@@ -4436,7 +4572,7 @@ static int btree_refill_dirty(struct btree *b, struct search *s, int *count)
 {
 	struct dirty *w;
 	struct btree_iter iter;
-	btree_iter_init(b, &iter, &KEY(s->d->id, s->d->last_found, 0), 0);
+	btree_iter_init(b, &iter, &KEY(s->d->id, s->d->last_found, 0));
 
 	/* To protect rb tree access vs. read_dirty() */
 	if (!b->level)

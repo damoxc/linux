@@ -23,6 +23,7 @@
 #define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
 
 #include <linux/blkdev.h>
+#include <linux/blktrace_api.h>
 #include <linux/buffer_head.h>
 #include <linux/console.h>
 #include <linux/ctype.h>
@@ -878,6 +879,22 @@ do {									\
 	for_each_key_after_filter(b, k, NULL, filter)
 
 #define for_each_key(b, k)	for_each_key_filter(b, k, all_keys)
+
+/* Blktrace macros */
+
+#define blktrace_msg(c, fmt, ...)					\
+do {									\
+	struct request_queue *q = bdev_get_queue(c->bdev);		\
+	if (q)								\
+		blk_add_trace_msg(q, fmt, #__VA_ARGS__);		\
+} while (0)
+
+#define blktrace_msg_all(s, fmt, ...)					\
+do {									\
+	struct cache *_c;						\
+	for_each_cache(_c, (s))						\
+		blktrace_msg(_c, fmt, #__VA_ARGS__);			\
+} while (0)
 
 static struct bset *write_block(struct btree *b)
 {
@@ -3403,6 +3420,8 @@ static void btree_gc(struct work_struct *w)
 
 	memset(&stats, 0, sizeof(struct gc_stat));
 
+	blktrace_msg_all(c, "Starting gc");
+
 	spin_lock(&c->bucket_lock);
 	for_each_cache(ca, c)
 		free_some_buckets(ca);
@@ -3430,6 +3449,7 @@ static void btree_gc(struct work_struct *w)
 	closure_sync(&sr.cl);
 
 	if (ret) {
+		blktrace_msg_all(c, "Stopped gc");
 		printk(KERN_WARNING "bcache: gc failed!\n");
 		queue_work(delayed, &c->gc_work);
 		goto out;
@@ -3452,6 +3472,7 @@ static void btree_gc(struct work_struct *w)
 	stats.data	<<= 9;
 	stats.in_use	= (c->nbuckets - available) * 100 / c->nbuckets;
 	memcpy(&c->gc_stats, &stats, sizeof(struct gc_stat));
+	blktrace_msg_all(c, "Finished gc");
 out:
 	mutex_unlock(&c->gc_lock);
 
@@ -6001,11 +6022,16 @@ static void prio_io(struct cache *c, uint64_t bucket, unsigned long rw)
 	closure_bio_submit(bio, &c->prio, c->set ? c->set->bio_split : NULL);
 }
 
+#define buckets_free(c)	"free %zu, free_inc %zu, unused %zu",		\
+	fifo_used(&c->free), fifo_used(&c->free_inc), fifo_used(&c->unused)
+
 static void prio_write_done(struct closure *cl)
 {
 	struct cache *c = container_of(cl, struct cache, prio);
+
 	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
 		 fifo_used(&c->free_inc), fifo_used(&c->unused));
+	blktrace_msg(c, "Finished priorities: " buckets_free(c));
 
 	spin_lock(&c->set->bucket_lock);
 
@@ -6026,6 +6052,10 @@ static void prio_write_done(struct closure *cl)
 static void prio_write_journal(struct closure *cl)
 {
 	struct cache *c = container_of(cl, struct cache, prio);
+
+	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
+		 fifo_used(&c->free_inc), fifo_used(&c->unused));
+	blktrace_msg(c, "Journalling priorities: " buckets_free(c));
 
 	c->prio_start = c->prio_next[0];
 	btree_journal_meta(c->set, cl);
@@ -6082,6 +6112,7 @@ static void prio_write(struct cache *c, struct closure *cl)
 
 	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
 		 fifo_used(&c->free_inc), fifo_used(&c->unused));
+	blktrace_msg(c, "Starting priorities: " buckets_free(c));
 }
 
 static int prio_read(struct cache *c, uint64_t bucket)

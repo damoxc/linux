@@ -649,9 +649,14 @@ struct search {
 	struct bio		*bio;
 	struct bio		*cache_bio;
 
-	/* Original bi_end_io and bi_private from s->bio */
-	bio_end_io_t		*bi_end_io;
-	void			*bi_private;
+	struct {
+		sector_t	bi_sector;
+		unsigned long	bi_flags;
+		unsigned long	bi_rw;
+		unsigned short	bi_idx;
+		bio_end_io_t	*bi_end_io;
+		void		*bi_private;
+	} bio_saved;
 
 	/* Stack frame for btree code */
 	struct closure		insert;
@@ -686,6 +691,7 @@ struct search {
 	unsigned		bio_done:1;
 	unsigned		lookup_done:1;
 	unsigned		cache_hit:1;
+	unsigned		recoverable:1;
 };
 
 const char *insert_types[] = {
@@ -727,6 +733,7 @@ static void queue_writeback(struct cached_dev *);
 static void prio_write(struct cache *, struct closure *);
 static void write_bdev_super(struct cached_dev *, struct closure *);
 static bool cache_set_error(struct cache_set *, const char *, ...);
+static void cache_io_error(struct cache *c, const char *m);
 static void do_discard(struct cache *);
 static void cache_read_endio(struct bio *, int);
 static void __request_read(struct closure *);
@@ -860,8 +867,8 @@ do {									\
 #define cache_set_err_on(cond, c, ...)					\
 	({ if (cond) cache_set_error(c, __VA_ARGS__); })
 
-#define cache_err_on(cond, c, ...)					\
-	({ if (cond) cache_error(c, __VA_ARGS__); })
+#define cache_io_err_on(cond, c, m)					\
+	({ if (cond) cache_io_error(c, m); })
 
 #define cache_bug_on(cond, c, ...)					\
 	({ if (cond) cache_bug(c, __VA_ARGS__); })
@@ -4678,7 +4685,7 @@ static void set_new_root(struct btree *b)
 static void uuid_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
-	cache_err_on(error, c, "accessing uuids");
+	cache_io_err_on(error, c, "accessing uuids");
 
 	bio_put(bio);
 	closure_put(c->set->uuid_writer, delayed);
@@ -4978,8 +4985,8 @@ static void write_dirty(struct closure *cl)
 static void read_dirty_endio(struct bio *bio, int error)
 {
 	struct dirty *w = bio->bi_private;
-	cache_err_on(error, PTR_CACHE(w->io->d->c, &w->key, 0),
-		      "reading from cache");
+	cache_io_err_on(error, PTR_CACHE(w->io->d->c, &w->key, 0),
+			"reading from cache");
 
 	dirty_endio(bio, error);
 }
@@ -5271,13 +5278,13 @@ err:
 
 static void __bio_complete(struct search *s)
 {
-	if (s->bio && s->bi_end_io) {
+	if (s->bio && s->bio_saved.bi_end_io) {
 		if (s->error)
 			clear_bit(BIO_UPTODATE, &s->bio->bi_flags);
 
-		s->bio->bi_private = s->bi_private;
-		s->bio->bi_end_io = s->bi_end_io;
-		s->bi_end_io(s->bio, s->error);
+		s->bio->bi_private	= s->bio_saved.bi_private;
+		s->bio->bi_end_io	= s->bio_saved.bi_end_io;
+		s->bio->bi_end_io(s->bio, s->error);
 	}
 	s->bio = NULL;
 }
@@ -5312,9 +5319,47 @@ static void bio_complete(struct closure *cl)
 	cached_dev_put(d);
 }
 
+static void request_endio(struct bio *bio, int error)
+{
+	struct search *s = bio->bi_private;
+	if (error) {
+		s->error = error;
+		/* Only cache read errors are recoverable */
+		s->recoverable = false;
+	}
+
+	bio_put(bio);
+	closure_put(&s->cl, delayed);
+}
+
+static void cache_read_endio(struct bio *bio, int error)
+{
+	struct search *s = bio->bi_private;
+	if (error) {
+		s->error = error;
+		cache_set_error(s->d->c, "reading from cache");
+	}
+
+	request_endio(bio, 0);
+}
+
+static void readahead_endio(struct bio *bio, int error)
+{
+	struct search *s = bio->bi_private;
+	if (error) {
+		/* XXX: record stat */
+		struct bio *p = xchg(&s->cache_bio, NULL);
+		if (p)
+			bio_put(p);
+	}
+
+	request_endio(bio, 0);
+}
+
 static void request_read_done(struct closure *cl)
 {
 	struct search *s = container_of(cl, struct search, cl);
+	struct bio_vec *bv;
 	struct bkey *k;
 
 	while ((k = keylist_pop(&s->keys)))
@@ -5326,7 +5371,7 @@ static void request_read_done(struct closure *cl)
 	}
 
 	if (s->cache_bio && !s->error && !atomic_read(&s->d->c->closing)) {
-		struct bio_vec *bv = bio_iovec_idx(s->cache_bio, s->pages_from);
+		bv = bio_iovec_idx(s->cache_bio, s->pages_from);
 
 		while (s->pages_from) {
 			struct page *p = alloc_page(__GFP_NOWARN|GFP_NOIO);
@@ -5344,25 +5389,43 @@ static void request_read_done(struct closure *cl)
 insert:
 		closure_init(&s->insert, &s->cl);
 		bio_insert(&s->insert);
+	} else if (s->error && s->recoverable) {
+		/* The cache read failed, but we can retry direct to the
+		 * backing device. */
+		struct bio *bio = s->bio;
+		int i;
+
+		s->error = 0;
+
+		/* XXX: invalidate cache */
+
+		pr_debug("recovering at sector %llu",
+			 (uint64_t) s->bio_saved.bi_sector);
+
+		/* We only recover bios that use whole pages. */
+		bio->bi_sector	= s->bio_saved.bi_sector;
+		bio->bi_next	= NULL;
+		bio->bi_bdev	= s->d->bdev;
+		bio->bi_flags	= s->bio_saved.bi_flags;
+		bio->bi_rw	= s->bio_saved.bi_rw;
+		bio->bi_idx	= s->bio_saved.bi_idx;
+		bio->bi_size	= (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE;
+
+		bio->bi_end_io	= request_endio;
+		bio->bi_private	= s;
+
+		bio_for_each_segment(bv, bio, i)
+			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
+
+		pr_debug("recovering from failed cache read %llu, %i pages",
+			 (uint64_t) bio->bi_sector, bio->bi_vcnt);
+
+		closure_get(&s->cl);
+		bio_get(bio);
+		generic_make_request(bio);
 	}
 
 	return_f(cl, bio_complete);
-}
-
-static void request_endio(struct bio *bio, int error)
-{
-	struct search *s = bio->bi_private;
-	s->error = error;
-	bio_put(bio);
-	closure_put(&s->cl, delayed);
-}
-
-static void cache_read_endio(struct bio *bio, int error)
-{
-	struct search *s = bio->bi_private;
-	cache_set_err_on(error, s->d->c, "reading from cache");
-
-	request_endio(bio, error);
 }
 
 static void check_should_skip(struct search *s)
@@ -5448,17 +5511,26 @@ static struct search *do_bio_hook(struct bio *bio, struct cached_dev *d)
 	closure_init(&s->cl, NULL);
 	closure_init(&s->insert, &s->cl);
 
-	s->d		= d;
-	s->task		= get_current();
-	s->bio		= bio;
-	s->bi_end_io	= bio->bi_end_io;
-	s->bi_private	= bio->bi_private;
-	s->pages_from	= USHRT_MAX;
-	s->cl.fn	= bio_complete;
+	s->d			= d;
+	s->task			= get_current();
+	s->bio			= bio;
+	s->pages_from		= USHRT_MAX;
+	s->cl.fn		= bio_complete;
 
-	bio->bi_end_io	= request_endio;
-	bio->bi_private = s;
+	s->bio_saved.bi_sector	= bio->bi_sector;
+	s->bio_saved.bi_flags	= bio->bi_flags;
+	s->bio_saved.bi_rw	= bio->bi_rw;
+	s->bio_saved.bi_idx	= bio->bi_idx;
+	s->bio_saved.bi_end_io	= bio->bi_end_io;
+	s->bio_saved.bi_private	= bio->bi_private;
+
+	bio->bi_end_io		= request_endio;
+	bio->bi_private		= s;
 	bio_get(bio);
+
+	/* We only recover bios that use whole pages. */
+	if (bio->bi_size == (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE)
+		s->recoverable = 1;
 
 	return s;
 }
@@ -5494,9 +5566,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 	bio->bi_rw	= last_bio->bi_rw;
 	bio->bi_size	= sectors << 9;
 
-	/* XXX: don't want to pass an error all the way up, just need to make
-	 * sure bio_insert doesn't get called */
-	bio->bi_end_io	= request_endio;
+	bio->bi_end_io	= readahead_endio;
 	bio->bi_private	= s;
 
 	bio_map(bio, NULL);
@@ -5511,8 +5581,8 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 	s->cache_bio->bi_vcnt += bio->bi_vcnt;
 	s->cache_bio->bi_size += bio->bi_size;
 
-	pr_debug("%i + %i --> %i", bio_sectors(last_bio),
-		 bio_sectors(bio), bio_sectors(s->cache_bio));
+	pr_debug("reading %i + %i sectors", bio_sectors(last_bio),
+		 bio_sectors(bio));
 	atomic_long_inc(&s->d->cache_readaheads);
 
 	closure_get(&s->cl);
@@ -6171,7 +6241,7 @@ static void write_super_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
 
-	cache_err_on(error, c, "writing superblock");
+	cache_io_err_on(error, c, "writing superblock");
 	closure_put(c->set->sb_writer, delayed);
 }
 
@@ -6209,7 +6279,7 @@ static void write_super(struct cache_set *c, struct closure *cl)
 static void prio_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
-	cache_err_on(error, c, "writing priorities");
+	cache_io_err_on(error, c, "writing priorities");
 
 	bio_put(bio);
 	closure_put(&c->prio, system_wq);
@@ -7122,6 +7192,16 @@ static bool cache_set_error(struct cache_set *c, const char *m, ...)
 
 	queue_work(delayed, &c->unregister);
 	return true;
+}
+
+static void cache_io_error(struct cache *c, const char *m)
+{
+	char buf[BDEVNAME_SIZE];
+
+	printk(KERN_ERR "bcache: IO error on %s %s\n",
+	       bdevname(c->bdev, buf), m);
+
+	cache_set_error(c->set, "IO error");
 }
 
 static void free_cache_set(struct cache_set *c)

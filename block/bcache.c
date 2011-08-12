@@ -591,7 +591,9 @@ struct btree {
 
 	union {
 		struct bset	*data;
-		struct bset	*sets[4];
+		struct bset	*sets[5];
+		/* Has to be 1 greater than the normal max for coalescing in
+		 * btree_gc_recurse() */
 	};
 
 #define BSET_TREE_SIZE	63
@@ -704,7 +706,7 @@ static void prio_write(struct cache *, struct closure *);
 static void write_bdev_super(struct cached_dev *, struct closure *);
 static bool cache_set_error(struct cache_set *, const char *, ...);
 static void do_discard(struct cache *);
-static void cache_request_endio(struct bio *, int);
+static void cache_read_endio(struct bio *, int);
 static void __request_read(struct closure *);
 static void __bio_complete(struct search *);
 static void btree_journal(struct closure *);
@@ -871,7 +873,7 @@ do {									\
 
 #define for_each_key_after_filter(b, k, search, filter)			\
 	for (struct bset **_i = b->sets; _i <= b->sets + b->nsets; _i++)\
-		for (k = btree_bsearch(*_i, search);			\
+		for (k = bset_bsearch(*_i, search);			\
 		     (k = bkey_filter(b, *_i, k, filter)) < end(*_i);	\
 		     k = next(k))
 
@@ -976,8 +978,8 @@ static unsigned bset_middle(struct bset *i, unsigned l, unsigned r)
 }
 
 __pure
-static struct bkey *__btree_bsearch(struct bset *i, const struct bkey *search,
-				    unsigned l, unsigned r)
+static struct bkey *__bset_bsearch(struct bset *i, const struct bkey *search,
+				   unsigned l, unsigned r)
 {
 	/* Returns the smallest key greater than the search key.
 	 * This is because we index by the end, not the beginning
@@ -995,9 +997,9 @@ static struct bkey *__btree_bsearch(struct bset *i, const struct bkey *search,
 }
 
 inline
-static struct bkey *btree_bsearch(struct bset *i, const struct bkey *search)
+static struct bkey *bset_bsearch(struct bset *i, const struct bkey *search)
 {
-	return search ? __btree_bsearch(i, search, 0, i->keys) : i->start;
+	return search ? __bset_bsearch(i, search, 0, i->keys) : i->start;
 }
 
 static void bset_build_tree(struct btree *b, unsigned set)
@@ -1030,8 +1032,8 @@ static void bset_build_tree(struct btree *b, unsigned set)
 	recurse(0, 0, i->keys);
 }
 
-static struct bkey *btree_bsearch_tree(struct btree *b, unsigned set,
-				       const struct bkey *search)
+static struct bkey *bset_bsearch_tree(struct btree *b, unsigned set,
+				      const struct bkey *search)
 {
 	struct bset *i		= b->sets[set];
 	struct bset_tree *t	= &b->tree[set];
@@ -1048,7 +1050,7 @@ static struct bkey *btree_bsearch_tree(struct btree *b, unsigned set,
 		}
 	}
 
-	return __btree_bsearch(i, search, l, r);
+	return __bset_bsearch(i, search, l, r);
 }
 
 /* Btree iterator */
@@ -1115,12 +1117,12 @@ static struct bkey *btree_iter_init(struct btree *b, struct btree_iter *iter,
 	iter->top = iter->sets;
 
 	if (b->sets[i] == write_block(b)) {
-		iter->top->k = ret = btree_bsearch(b->sets[i], search);
+		iter->top->k = ret = bset_bsearch(b->sets[i], search);
 		goto start;
 	}
 
 	do {
-		iter->top->k	= btree_bsearch_tree(b, i, search);
+		iter->top->k	= bset_bsearch_tree(b, i, search);
 start:		iter->top->end	= end(b->sets[i]);
 
 		btree_iter_push(iter);
@@ -1900,12 +1902,12 @@ static struct bkey *next_recurse_key(struct btree *b, struct bkey *search)
 	struct bkey *k, *ret = NULL;
 
 	if (b->sets[i] == write_block(b)) {
-		k = btree_bsearch(b->sets[i], search);
+		k = bset_bsearch(b->sets[i], search);
 		goto start;
 	}
 
 	do {
-		k = btree_bsearch_tree(b, i, search);
+		k = bset_bsearch_tree(b, i, search);
 start:
 		for (; k < end(b->sets[i]);
 		     k = next(k))
@@ -2832,7 +2834,7 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 
 	ret->bi_sector	= sector;
 	ret->bi_bdev	= bdev;
-	ret->bi_end_io	= cache_request_endio;
+	ret->bi_end_io	= cache_read_endio;
 
 	if (ret != bio) {
 		closure_get(&s->cl);
@@ -3554,7 +3556,7 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 				struct bkey *m = j;
 
 				if (j < w->start) {
-					m = btree_bsearch(w, k);
+					m = bset_bsearch(w, k);
 					shift_keys(w, m, j);
 
 					cut_back(&START_KEY(k), j);
@@ -3664,7 +3666,7 @@ copy:
 			if (merge(i, m, k))
 				goto merged;
 		} else
-			m = btree_bsearch(i, k);
+			m = bset_bsearch(i, k);
 
 		status = "inserting";
 		shift_keys(i, m, k);
@@ -5136,7 +5138,7 @@ static void bio_complete(struct closure *cl)
 	cached_dev_put(d);
 }
 
-static void cache_request(struct closure *cl)
+static void request_read_done(struct closure *cl)
 {
 	struct search *s = container_of(cl, struct search, cl);
 	struct bkey *k;
@@ -5181,7 +5183,7 @@ static void request_endio(struct bio *bio, int error)
 	closure_put(&s->cl, delayed);
 }
 
-static void cache_request_endio(struct bio *bio, int error)
+static void cache_read_endio(struct bio *bio, int error)
 {
 	struct search *s = bio->bi_private;
 	cache_set_err_on(error, s->d->c, "reading from cache");
@@ -5379,7 +5381,7 @@ static void __request_read(struct closure *cl)
 
 static int request_read(struct search *s)
 {
-	s->cl.fn	= cache_request;
+	s->cl.fn	= request_read_done;
 	s->insert_type	= INSERT_READ;
 	check_should_skip(s);
 

@@ -108,6 +108,10 @@ config BCACHE
 
 	See Documentation/bcache.txt for details.
 
+config BCACHE_DEBUG
+	bool "Bcache debugging"
+	depends on BCACHE
+
 config BCACHE_EDEBUG
 	bool "Extended runtime checks"
 	depends on BCACHE

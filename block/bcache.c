@@ -708,6 +708,7 @@ static void set_new_root(struct btree *);
 static void btree_journal_wait(struct cache_set *, struct closure *);
 static inline void cached_dev_put(struct cached_dev *);
 static void cache_init_journal(struct cache *);
+static struct cache_set *alloc_cache_set(struct cache_sb *);
 
 #define btree_prio		((uint16_t) ~0)
 #define MAX_NEED_GC		64
@@ -1784,31 +1785,37 @@ static bool should_split(struct btree *b)
 
 /* Debug code */
 
-static void vdump_bucket_and_panic(struct btree *b, const char *m, va_list args)
+static void dump_bset(struct btree *b, struct bset *i)
 {
-	struct bkey *k;
+	for (struct bkey *k = i->start; k < end(i); k = next(k)) {
+		printk(KERN_ERR "block %i key %zu/%i: %s", index(i, b),
+		       (uint64_t *) k - i->d, i->keys, pkey(k));
 
-	acquire_console_sem();
+		for (unsigned j = 0; j < KEY_PTRS(k); j++) {
+			size_t n = PTR_BUCKET_NR(b->c, k, j);
+			printk(" bucket %zu", n);
 
-	for_each_key(b, k) {
-		printk(KERN_ERR "block %i key %zu/%i: %s", index(*_i, b),
-		       (uint64_t *) k - (*_i)->d, (*_i)->keys, pkey(k));
-
-		for (unsigned i = 0; i < KEY_PTRS(k); i++) {
-			size_t j = PTR_BUCKET_NR(b->c, k, i);
-			printk(" bucket %li", j);
-
-			if (j >= b->c->sb.first_bucket && j < b->c->sb.nbuckets)
+			if (n >= b->c->sb.first_bucket && n < b->c->sb.nbuckets)
 				printk(" prio %i",
-				       PTR_BUCKET(b->c, k, i)->prio);
+				       PTR_BUCKET(b->c, k, j)->prio);
 		}
 
 		printk(" %s\n", ptr_status(b->c, k));
 
-		if (next(k) != end(*_i) &&
+		if (next(k) != end(i) &&
 		    bkey_cmp(k, &START_KEY(next(k))) > 0)
 			printk(KERN_ERR "Key skipped backwards\n");
 	}
+}
+
+static void vdump_bucket_and_panic(struct btree *b, const char *m, va_list args)
+{
+	struct bset *i;
+
+	acquire_console_sem();
+
+	for_each_sorted_set(b, i)
+		dump_bset(b, i);
 
 	vprintk(m, args);
 
@@ -2947,6 +2954,29 @@ static void btree_sort(struct btree *b, int start, struct bset *new)
 	btree_iter_init(b, &iter, NULL, start);
 
 	__btree_sort(b, start, new, &iter, false);
+}
+
+static void btree_sort_lazy(struct btree *b)
+{
+	struct bset *i;
+	unsigned keys = 0;
+
+	for_each_sorted_set(b, i)
+		keys += i->keys;
+
+	if (b->nsets > 3)
+		for (unsigned j = 0; b->nsets - j > 2; j++) {
+			if (keys > b->sets[j]->keys * 2 ||
+			    keys < 100) {
+				btree_sort(b, j, NULL);
+				return;
+			}
+
+			keys -= b->sets[j]->keys;
+		}
+
+	if (b->nsets > max(2, 4 - b->level))
+		btree_sort(b, 0, NULL);
 }
 
 static void btree_mark_meta(struct cache_set *c)
@@ -5378,6 +5408,8 @@ static int btree_check(struct btree *b, struct search *s)
 	return 0;
 }
 
+/* More debug code */
+
 static struct dentry *debug;
 
 #ifdef CONFIG_DEBUG_FS
@@ -5446,6 +5478,136 @@ static const struct file_operations cache_debug_ops = {
 	.read		= seq_read,
 	.release	= single_release
 };
+#endif
+
+#ifdef CONFIG_BCACHE_DEBUG
+static ssize_t btree_fuzz(struct kobject *k, struct kobj_attribute *a,
+		      const char *buffer, size_t size)
+{
+	void dump(struct btree *b)
+	{
+		for (struct bset *i = b->data;
+		     index(i, b) < btree_blocks(b) && i->seq == b->data->seq;
+		     i = ((void *) i) + set_blocks(i, b->c) * block_bytes(b->c))
+			dump_bset(b, i);
+	}
+
+	struct search sr;
+	struct cache_sb *sb;
+	struct cache_set *c;
+	struct btree *all[3], *b, *fill, *orig;
+
+	search_init_stack(&sr);
+	sr.insert_type = INSERT_WRITE;
+
+	sb = kzalloc(sizeof(struct cache_sb), GFP_KERNEL);
+	if (!sb)
+		return -ENOMEM;
+
+	sb->bucket_size = 128;
+	sb->block_size = 4;
+
+	c = alloc_cache_set(sb);
+	if (!c)
+		return -ENOMEM;
+
+	for (int i = 0; i < 3; i++) {
+		BUG_ON(list_empty(&c->lru));
+		all[i] = list_first_entry(&c->lru, struct btree, lru);
+		list_del_init(&all[i]->lru);
+
+		all[i]->key = KEY(0, 0, c->sb.bucket_size);
+		bkey_copy_key(&all[i]->key, &MAX_KEY);
+	}
+
+	b = all[0];
+	fill = all[1];
+	orig = all[2];
+
+	while (1) {
+		for (int i = 0; i < 3; i++)
+			all[i]->written = all[i]->nsets = 0;
+
+		bset_init(b, b->data);
+
+		while (1) {
+			struct bset *i = write_block(b);
+			struct bkey *k = sr.keys.top;
+
+			k->key = get_random_int();
+
+			sr.insert_type = k->key & 1
+				? INSERT_WRITE
+				: INSERT_READ;
+			k->key >>= 1;
+
+			k->header = KEY_HEADER(k->key % c->sb.bucket_size, 0);
+			k->key /= c->sb.bucket_size;
+			k->key %= 1024 * 512;
+			k->key += c->sb.bucket_size;
+#if 0
+			SET_KEY_PTRS(k, 1);
+#endif
+			keylist_push(&sr.keys);
+			btree_insert_keys(b, &sr);
+
+			if (should_split(b) ||
+			    set_blocks(i, b->c) !=
+			    __set_blocks(i, i->keys + 15, b->c)) {
+				i->csum = csum_set(i);
+
+				memcpy(write_block(fill),
+				       i, set_bytes(i));
+
+				b->written += set_blocks(i, b->c);
+				fill->written = b->written;
+				if (b->written == btree_blocks(b))
+					break;
+
+				btree_sort_lazy(b);
+
+				b->sets[++b->nsets] = write_block(b);
+				bset_init(b, write_block(b));
+			}
+		}
+
+		memcpy(orig->data,
+		       fill->data,
+		       btree_bytes(c));
+
+		btree_sort(b, 0, NULL);
+		fill->written = 0;
+		fill_bucket_work(&fill->work.work);
+
+		if (b->data->keys != fill->data->keys ||
+		    memcmp(b->data->start,
+			   fill->data->start,
+			   b->data->keys * sizeof(uint64_t))) {
+			struct bset *i = b->data;
+
+			for (struct bkey *k = i->start, *j = fill->data->start;
+			     k < end(i);
+			     k = next(k), j = next(j))
+				if (bkey_cmp(k, j) ||
+				    KEY_SIZE(k) != KEY_SIZE(j))
+					printk(KERN_ERR "key %li differs: %s "
+					       "!= %s\n", (uint64_t *) k - i->d,
+					       pkey(k), pkey(j));
+
+			for (int i = 0; i < 3; i++) {
+				printk(KERN_ERR "**** Set %i ****\n", i);
+				dump(all[i]);
+			}
+			panic("\n");
+		}
+
+		printk(KERN_DEBUG "bcache: fuzz complete: %i keys\n",
+		       b->data->keys);
+	}
+}
+
+static struct kobj_attribute sysfs_fuzz =
+	__ATTR(fuzz, S_IWUSR, NULL, btree_fuzz);
 #endif
 
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
@@ -7340,6 +7502,9 @@ static int __init bcache_init(void)
 {
 	static const struct attribute *files[] = {
 		&sysfs_register.attr,
+#ifdef CONFIG_BCACHE_DEBUG
+		&sysfs_fuzz.attr,
+#endif
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
 		&sysfs_latency_warn_ms.attr,
 #endif

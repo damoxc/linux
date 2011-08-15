@@ -2318,19 +2318,6 @@ static int shrink_buckets(int nr, gfp_t flags)
 	return ret * c->btree_pages;
 }
 
-static int btree_cache_size(struct cache_set *c)
-{
-	struct list_head *l;
-	int i = 0;
-
-	spin_lock(&c->bucket_lock);
-	list_for_each(l, &c->lru)
-		i++;
-	spin_unlock(&c->bucket_lock);
-
-	return i;
-}
-
 static struct hlist_head *hash_bucket(struct cache_set *c, struct bkey *k)
 {
 	return &c->bucket_hash[hash_64(PTR_HASH(k), BUCKET_HASH_BITS)];
@@ -6009,8 +5996,7 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 	{
 		unsigned long hits = atomic_long_read(&d->cache_hits);
 		unsigned long misses = atomic_long_read(&d->cache_misses);
-		unsigned long total = hits + misses;
-		return total ? hits * 100 / total : 0;
+		return DIV_SAFE(hits * 100, hits + misses);
 	}
 
 	sysfs_print(writeback, "%i",		d->writeback);
@@ -6402,16 +6388,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 	unsigned cache_hit_ratio(struct cache_set *c)
 	{
 		unsigned long hits = cache_hits(c), misses = cache_misses(c);
-		unsigned long total = hits + misses;
-		return total ? hits * 100 / total : 0;
-	}
-
-	unsigned avg_keys_written(struct cache_set *c)
-	{
-		long writes = atomic_long_read(&c->btree_write_count);
-		return writes
-			? atomic_long_read(&c->keys_write_count) / writes
-			: 0;
+		return DIV_SAFE(hits * 100, hits + misses);
 	}
 
 	unsigned root_usage(struct cache_set *c)
@@ -6425,22 +6402,43 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 		return (bytes * 100) / btree_bytes(c);
 	}
 
+	size_t cache_size(struct cache_set *c)
+	{
+		size_t ret = 0;
+		struct btree *b;
+
+		spin_lock(&c->bucket_lock);
+		list_for_each_entry(b, &c->lru, lru)
+			ret += 1 << (b->page_order + PAGE_SHIFT);
+
+		spin_unlock(&c->bucket_lock);
+		return ret;
+	}
+
 	sysfs_print(synchronous,	"%i", (int) CACHE_SYNC(&c->sb));
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
 	sysfs_print(tree_depth,		"%u", c->root->level);
 	sysfs_print(root_usage_percent,	"%u", root_usage(c));
-	sysfs_print(btree_avg_keys_written, "%u", avg_keys_written(c));
-	sysfs_print(btree_cache_size,	"%i", btree_cache_size(c));
+	sysfs_print(btree_avg_keys_written, "%li",
+		    DIV_SAFE(atomic_long_read(&c->keys_write_count),
+			     atomic_long_read(&c->btree_write_count)));
+
+	sysfs_hprint(btree_cache_size,	cache_size(c));
 
 	sysfs_print(average_seconds_between_gc, "%li",
-		    (get_seconds() - c->sb.last_mount) / c->gc_stats.count);
+		    DIV_SAFE(get_seconds() - c->sb.last_mount,
+			     c->gc_stats.count));
+
 	sysfs_print(gc_ms_max,		"%u", c->gc_stats.ms_max);
-	sysfs_print(seconds_since_gc,	"%li",
+	sysfs_print(seconds_since_gc,	"%li", !c->gc_stats.last ? -1 :
 		    get_seconds() - c->gc_stats.last);
+
 	sysfs_print(btree_nodes,	"%zu", c->gc_stats.nodes);
 	sysfs_print(btree_used_percent,	"%u", btree_used(c));
-	sysfs_hprint(average_key_size,	c->gc_stats.data / c->gc_stats.nkeys);
+	sysfs_hprint(average_key_size,	DIV_SAFE(c->gc_stats.data,
+						 c->gc_stats.nkeys));
+
 	sysfs_hprint(dirty_data,	c->gc_stats.dirty);
 
 	sysfs_print(writeback_keys_done,	"%li",
@@ -6499,8 +6497,11 @@ static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
 	}
 
 	if (attr == &sysfs_clear_stats) {
-		atomic_long_set(&c->btree_write_count, 0);
-		atomic_long_set(&c->keys_write_count, 0);
+		atomic_long_set(&c->writeback_keys_done,	0);
+		atomic_long_set(&c->writeback_keys_failed,	0);
+		atomic_long_set(&c->btree_write_count,		0);
+		atomic_long_set(&c->keys_write_count,		0);
+		memset(&c->gc_stats, 0, sizeof(struct gc_stat));
 	}
 
 	return size;
@@ -6976,7 +6977,7 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 	sysfs_hprint(block_size,	block_bytes(c));
 	sysfs_print(nbuckets,		"%lli", c->sb.nbuckets);
 	sysfs_print(heap_size,		"%zu", c->heap.size);
-	sysfs_print(discard, "%i", c->discard);
+	sysfs_print(discard,		"%i", c->discard);
 	sysfs_hprint(written, atomic_long_read(&c->sectors_written) << 9);
 	sysfs_hprint(btree_written,
 		     atomic_long_read(&c->btree_sectors_written) << 9);

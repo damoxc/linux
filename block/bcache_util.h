@@ -276,6 +276,15 @@ ssize_t hprint(char *buf, int64_t v);
 bool is_zero(const char *p, size_t n);
 int parse_uuid(const char *s, char *uuid);
 
+#define __DIV_SAFE(n, d, zero)						\
+({									\
+	typeof(n) _n = (n);						\
+	typeof(d) _d = (d);						\
+	_d ? _n / _d : zero;						\
+})
+
+#define DIV_SAFE(n, d)	__DIV_SAFE(n, d, 0)
+
 #define RB_INSERT(root, new, member, cmp)				\
 ({									\
 	__label__ dup;							\

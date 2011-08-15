@@ -156,6 +156,10 @@ struct bkey {
 #define BKEY_PADDED(key)					\
 	union { struct bkey key; uint64_t key ## _pad[8]; }
 
+/* Version 1: Seed pointer into btree node checksum
+ */
+#define BCACHE_BSET_VERSION	1
+
 struct bset {
 	uint64_t		csum;
 	uint64_t		magic;
@@ -264,6 +268,11 @@ struct uuid_entry {
 	uint32_t	invalidated;
 	uint32_t	pad;
 };
+
+/* Version 1: Backing device
+ * Version 2: Seed pointer into btree node checksum
+ */
+#define BCACHE_SB_VERSION	2
 
 #define SB_LABEL_SIZE		32
 #define SB_JOURNAL_BUCKETS	256
@@ -2207,6 +2216,15 @@ static void check_key_order_msg(struct btree *b, struct bset *i,
 
 /* Btree IO */
 
+static uint64_t btree_csum_set(struct btree *b, struct bset *i)
+{
+	uint64_t crc = b->key.ptr[0];
+	void *data = (void *) i + 8, *end = end(i);
+
+	crc = crc64_update(crc, data, end - data);
+	return crc ^ 0xffffffffffffffff;
+}
+
 static void btree_bio_resubmit(struct work_struct *w)
 {
 	struct btree *b = container_of(to_delayed_work(w), struct btree, work);
@@ -2239,6 +2257,10 @@ static void fill_bucket_work(struct work_struct *w)
 	for (i = b->data;
 	     b->written < btree_blocks(b) && i->seq == b->data->seq;
 	     i = write_block(b)) {
+		err = "unsupported bset version";
+		if (i->version > BCACHE_BSET_VERSION)
+			goto err;
+
 		err = "bad btree header";
 		if (b->written + set_blocks(i, b->c) > btree_blocks(b))
 			goto err;
@@ -2248,8 +2270,16 @@ static void fill_bucket_work(struct work_struct *w)
 			goto err;
 
 		err = "bad checksum";
-		if (i->csum != csum_set(i))
-			goto err;
+		switch (i->version) {
+		case 0:
+			if (i->csum != csum_set(i))
+				goto err;
+			break;
+		case BCACHE_BSET_VERSION:
+			if (i->csum != btree_csum_set(b, i))
+				goto err;
+			break;
+		}
 
 		err = "empty set";
 		if (i != b->data && !i->keys)
@@ -2406,12 +2436,14 @@ static int __btree_write(struct btree *b)
 	}
 
 	__cancel_delayed_work(&b->work);
+
 	pr_latency(w->wait_time, "btree write");
 	set_wait(w);
-
-	BUG_ON(b->written && !i->keys);
 	check_key_order(b, i);
-	i->csum = csum_set(i);
+	BUG_ON(b->written && !i->keys);
+
+	i->version	= BCACHE_BSET_VERSION;
+	i->csum		= btree_csum_set(b, i);
 
 	btree_bio_init(b);
 	b->bio.bi_rw	       |= REQ_WRITE|REQ_SYNC;
@@ -6118,7 +6150,7 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 		goto err;
 
 	err = "Unsupported superblock version";
-	if (sb->version > CACHE_BACKING_DEV)
+	if (sb->version > BCACHE_SB_VERSION)
 		goto err;
 
 	err = "Bad block/bucket size";
@@ -6259,7 +6291,7 @@ static void write_super(struct cache_set *c, struct closure *cl)
 	for_each_cache(ca, c) {
 		struct bio *bio = &ca->sb_bio;
 
-		ca->sb.version		= c->sb.version;
+		ca->sb.version		= BCACHE_SB_VERSION;
 		ca->sb.flags		= c->sb.flags;
 		ca->sb.seq		= c->sb.seq;
 		ca->sb.last_mount	= c->sb.last_mount;

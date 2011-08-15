@@ -495,6 +495,7 @@ do {									\
 #define closure_bio_submit(bio, c, bs)					\
 	bio_submit_split(bio, &(c)->remaining, bs)
 
+uint64_t crc64_update(uint64_t, const void *, size_t);
 uint64_t crc64(const void *, size_t);
 
 #endif /* _BCACHE_UTIL_H */

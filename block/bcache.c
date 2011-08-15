@@ -550,7 +550,7 @@ struct cached_dev {
 };
 
 struct btree_write {
-#ifdef DEBUG_LATENCY
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
 	unsigned long		wait_time;
 #endif
 	struct btree		*b;
@@ -683,7 +683,9 @@ static int bcache_major, bcache_minor;
  * Sysfs vars / tunables
  */
 static uint16_t	initial_prio = 32768;
-static unsigned latency_warn_ms;
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
+unsigned latency_warn_ms;
+#endif
 
 static void dump_bucket_and_panic(struct btree *, const char *, ...);
 static int __btree_write(struct btree *);
@@ -2197,7 +2199,7 @@ static void btree_write(struct btree *b, bool now, struct search *s)
 	     set_blocks(i, b->c) == __set_blocks(i, i->keys + 15, b->c)))
 		return;
 
-#ifdef DEBUG_LATENCY
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
 	if (!b->write->wait_time)
 		set_wait(b->write);
 #endif
@@ -7332,7 +7334,7 @@ static int __init bcache_init(void)
 {
 	static const struct attribute *files[] = {
 		&sysfs_register.attr,
-#ifdef DEBUG_LATENCY
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
 		&sysfs_latency_warn_ms.attr,
 #endif
 		NULL};

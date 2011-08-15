@@ -1175,6 +1175,9 @@ static void bset_build_tree(struct btree *b, unsigned set)
 	for (int j = set; j < 4; j++)
 		b->tree[j].size = 0;
 
+	if (!b->tree->key)
+		return;
+
 	if (set) {
 		struct bset_tree *p = &b->tree[set - 1];
 		t->key = p->key + roundup(p->size,
@@ -2411,7 +2414,7 @@ static int __btree_write(struct btree *b)
 	i->csum = csum_set(i);
 
 	btree_bio_init(b);
-	b->bio.bi_rw	       |= WRITE_SYNC;
+	b->bio.bi_rw	       |= REQ_WRITE|REQ_SYNC;
 	b->bio.bi_size		= set_blocks(i, b->c) * block_bytes(b->c);
 	b->bio.bi_end_io	= btree_write_endio;
 	b->bio.bi_private	= w;
@@ -3330,7 +3333,7 @@ static void __btree_mark_key(struct cache_set *c, int level, struct bkey *k)
 		else if (KEY_DIRTY(k))
 			g->mark = GC_MARK_DIRTY;
 		else if (g->mark >= 0 &&
-			 ((int) g->mark) + KEY_SIZE(k) < SHORT_MAX)
+			 ((int) g->mark) + KEY_SIZE(k) < SHRT_MAX)
 			g->mark += KEY_SIZE(k);
 	}
 }
@@ -3596,7 +3599,7 @@ static void btree_gc(struct work_struct *w)
 
 	search_init_stack(&sr);
 	closure_init_stack(&sr.cl);
-	sr.lock = SHORT_MAX;
+	sr.lock = SHRT_MAX;
 
 	memset(&stats, 0, sizeof(struct gc_stat));
 
@@ -4538,7 +4541,7 @@ static void btree_journal_write(struct cache_set *s, struct journal_write *w)
 		bio_reset(bio);
 		bio->bi_sector	= PTR_OFFSET(&w->key, i);
 		bio->bi_bdev	= c->bdev;
-		bio->bi_rw	= REQ_META|WRITE_SYNC;
+		bio->bi_rw	= REQ_WRITE|REQ_SYNC|REQ_META;
 		bio->bi_size	= set_blocks(w->data, s) * block_bytes(s);
 
 		bio->bi_end_io	= btree_journal_endio;
@@ -4705,7 +4708,7 @@ static void uuid_io(struct cache_set *c, unsigned long rw,
 		bio_reset(bio);
 		bio->bi_sector	= PTR_OFFSET(k, i);
 		bio->bi_bdev	= ca->bdev;
-		bio->bi_rw	= REQ_META|rw;
+		bio->bi_rw	= REQ_SYNC|REQ_META|rw;
 		bio->bi_size	= KEY_SIZE(k) << 9;
 
 		bio->bi_end_io	= uuid_endio;
@@ -4719,7 +4722,7 @@ static void uuid_io(struct cache_set *c, unsigned long rw,
 			break;
 	}
 
-	pr_debug("%s UUIDs at %s", rw & WRITE ? "wrote" : "read",
+	pr_debug("%s UUIDs at %s", rw & REQ_WRITE ? "wrote" : "read",
 		 pkey(&c->uuid_bucket));
 	for (struct uuid_entry *u = c->uuids; u < c->uuids + c->nr_uuids; u++)
 		if (!is_zero(u->uuid, 16))
@@ -4740,7 +4743,7 @@ static int uuid_write(struct cache_set *c)
 		return 1;
 
 	SET_KEY_SIZE(&k.key, c->sb.bucket_size);
-	uuid_io(c, WRITE_SYNC, &k.key, &cl);
+	uuid_io(c, REQ_WRITE, &k.key, &cl);
 	closure_sync(&cl);
 
 	bkey_copy(&c->uuid_bucket, &k.key);
@@ -5234,7 +5237,7 @@ static void bio_insert(struct closure *cl)
 
 		cl->fn = btree_journal;
 
-		n->bi_rw	|= WRITE;
+		n->bi_rw	|= REQ_WRITE;
 		n->bi_sector	 = PTR_OFFSET(k, 0);
 		n->bi_bdev	 = PTR_CACHE(s->d->c, k, 0)->bdev;
 
@@ -6187,7 +6190,7 @@ static void __write_super(struct cache_sb *sb, struct bio *bio)
 	struct cache_sb *out = page_address(bio->bi_io_vec[0].bv_page);
 
 	bio->bi_sector	= SB_SECTOR;
-	bio->bi_rw	= WRITE_SYNC|REQ_META;
+	bio->bi_rw	= REQ_SYNC|REQ_META;
 	bio->bi_size	= SB_SIZE;
 	bio_map(bio, NULL);
 
@@ -6213,7 +6216,7 @@ static void __write_super(struct cache_sb *sb, struct bio *bio)
 	pr_debug("ver %llu, flags %llu, seq %llu",
 		 sb->version, sb->flags, sb->seq);
 
-	submit_bio(WRITE, bio);
+	submit_bio(REQ_WRITE, bio);
 }
 
 static void write_bdev_super(struct cached_dev *d, struct closure *cl)
@@ -6292,7 +6295,7 @@ static void prio_io(struct cache *c, uint64_t bucket, unsigned long rw)
 	bio_reset(bio);
 	bio->bi_sector	= bucket * c->sb.bucket_size;
 	bio->bi_bdev	= c->bdev;
-	bio->bi_rw	= REQ_META|rw;
+	bio->bi_rw	= REQ_SYNC|REQ_META|rw;
 	bio->bi_size	= bucket_bytes(c);
 
 	bio->bi_end_io	= prio_endio;
@@ -6366,7 +6369,7 @@ static void prio_write_bucket(struct closure *cl)
 	p->magic = pset_magic(c);
 	p->csum = crc64(&p->magic, bucket_bytes(c) - 8);
 
-	prio_io(c, c->prio_next[i], WRITE_SYNC);
+	prio_io(c, c->prio_next[i], REQ_WRITE);
 }
 
 static void prio_write(struct cache *c, struct closure *cl)
@@ -7099,7 +7102,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 		struct bset_stats t;
 
 		search_init_stack(&sr);
-		sr.lock = SHORT_MAX;
+		sr.lock = SHRT_MAX;
 		memset(&t, 0, sizeof(struct bset_stats));
 
 		btree_root(bset_stats, c, &sr, &t);
@@ -7113,7 +7116,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 			    "bytes/float:	%zu\n"
 			    "failed:		%zu",
 			    t.sets, t.keys, t.trees, t.tree_space,
-			    t.floats, t.keys / t.floats, t.failed);
+			    t.floats, DIV_SAFE(t.keys, t.floats), t.failed);
 	}
 
 	return 0;

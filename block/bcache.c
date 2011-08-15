@@ -5289,16 +5289,6 @@ skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
 	if (attr == &sysfs_ ## file)					\
 		return strtoi_h(buffer, &var) ? : size;			\
 
-static ssize_t show(struct kobject *, struct kobj_attribute *, char *);
-static ssize_t store(struct kobject *, struct kobj_attribute *,
-		     const char *, size_t);
-
-static struct kobj_attribute sysfs_register =
-	__ATTR(register, S_IWUSR, show, store);
-
-static struct kobj_attribute sysfs_latency_warn_ms =
-	__ATTR(latency_warn_ms, S_IWUSR|S_IRUSR, show, store);
-
 write_attribute(attach);
 write_attribute(detach);
 write_attribute(unregister);
@@ -5450,6 +5440,27 @@ static const struct file_operations cache_debug_ops = {
 	.read		= seq_read,
 	.release	= single_release
 };
+#endif
+
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
+static ssize_t show(struct kobject *k, struct kobj_attribute *attr,
+		    char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%i\n", latency_warn_ms);
+}
+
+static ssize_t store(struct kobject *k, struct kobj_attribute *attr,
+		     const char *buffer, size_t size);
+
+static struct kobj_attribute sysfs_latency_warn_ms =
+	__ATTR(latency_warn_ms, S_IWUSR|S_IRUSR, show, store);
+
+static ssize_t store(struct kobject *k, struct kobj_attribute *attr,
+		     const char *buffer, size_t size)
+{
+	sysfs_atoi(latency_warn_ms, latency_warn_ms);
+	return size;
+}
 #endif
 
 /* Superblock/other metadata */
@@ -7256,7 +7267,8 @@ err_nofree:
 
 /* Global interfaces/init */
 
-static ssize_t register_bcache(const char *buffer, size_t size)
+static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *a,
+			       const char *buffer, size_t size)
 {
 	ssize_t ret = size;
 	const char *err = "cannot allocate memory";
@@ -7314,23 +7326,8 @@ err:
 	return ret;
 }
 
-static ssize_t show(struct kobject *kobj, struct kobj_attribute *attr,
-		    char *buf)
-{
-	sysfs_print(latency_warn_ms, "%i", latency_warn_ms);
-
-	return 0;
-}
-
-static ssize_t store(struct kobject *kobj, struct kobj_attribute *attr,
-		     const char *buffer, size_t size)
-{
-	if (attr == &sysfs_register)
-		return register_bcache(buffer, size);
-	sysfs_atoi(latency_warn_ms, latency_warn_ms);
-
-	return size;
-}
+static struct kobj_attribute sysfs_register =
+	__ATTR(register, S_IWUSR, NULL, register_bcache);
 
 static int __init bcache_init(void)
 {

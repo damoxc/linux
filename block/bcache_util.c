@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/types.h>
+#include <linux/ratelimit.h>
 #include "bcache_util.h"
 
 MODULE_LICENSE("GPL");

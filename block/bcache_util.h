@@ -376,7 +376,8 @@ static inline unsigned bio_max_sectors(struct bio *bio)
 	return __bio_max_sectors(bio, bio->bi_bdev, bio->bi_sector);
 }
 
-#ifdef DEBUG_LATENCY
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
+extern unsigned latency_warn_ms;
 
 #define pr_latency(j, fmt, ...)						\
 do {									\
@@ -431,7 +432,7 @@ struct closure {
 	struct list_head	all;
 	unsigned long		waiting_on;
 #endif
-#ifdef DEBUG_LATENCY
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
 	unsigned long		wait_time;
 #endif
 };

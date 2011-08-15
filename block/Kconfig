@@ -122,6 +122,15 @@ config BCACHE_CLOSURE_DEBUG
 	interface to list them, which makes it possible to see asynchronous
 	operations that get stuck.
 
+config BCACHE_LATENCY_DEBUG
+	bool "Latency tracing for bcache"
+	depends on BCACHE
+	---help---
+	Hacky latency tracing that has nevertheless been useful in the past:
+	adds a global variable accessible via /sys/fs/bcache/latency_warn_ms,
+	which defaults to 0. If nonzero, any timed operation that takes longer
+	emits a printk.
+
 endif # BLOCK
 
 config BLOCK_COMPAT

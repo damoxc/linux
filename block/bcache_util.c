@@ -631,15 +631,24 @@ static const uint64_t crc_table[256] = {
 	0x9AFCE626CE85B507
 };
 
-inline uint64_t crc64(const void *_data, size_t len)
+uint64_t crc64_update(uint64_t crc, const void *_data, size_t len)
 {
-	uint64_t crc = 0xffffffffffffffff;
 	const unsigned char *data = _data;
 
 	while (len--) {
 		int i = ((int) (crc >> 56) ^ *data++) & 0xFF;
 		crc = crc_table[i] ^ (crc << 8);
 	}
+
+	return crc;
+}
+EXPORT_SYMBOL(crc64_update);
+
+uint64_t crc64(const void *data, size_t len)
+{
+	uint64_t crc = 0xffffffffffffffff;
+
+	crc = crc64_update(crc, data, len);
 
 	return crc ^ 0xffffffffffffffff;
 }

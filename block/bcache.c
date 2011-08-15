@@ -5359,78 +5359,6 @@ static void readahead_endio(struct bio *bio, int error)
 	request_endio(bio, 0);
 }
 
-static void request_read_done(struct closure *cl)
-{
-	struct search *s = container_of(cl, struct search, cl);
-	struct bio_vec *bv;
-	struct bkey *k;
-
-	while ((k = keylist_pop(&s->keys)))
-		__bkey_put(s->d->c, k);
-
-	if (!s->lookup_done) {
-		closure_init(&s->insert, &s->cl);
-		return_f(&s->insert, __request_read);
-	}
-
-	if (s->cache_bio && !s->error && !atomic_read(&s->d->c->closing)) {
-		bv = bio_iovec_idx(s->cache_bio, s->pages_from);
-
-		while (s->pages_from) {
-			struct page *p = alloc_page(__GFP_NOWARN|GFP_NOIO);
-			if (!p)
-				goto insert;
-
-			s->pages_from--, bv--;
-
-			memcpy(page_address(p), kmap(bv->bv_page), PAGE_SIZE);
-			kunmap(bv->bv_page);
-			bv->bv_page = p;
-		}
-
-		__bio_complete(s);
-insert:
-		closure_init(&s->insert, &s->cl);
-		bio_insert(&s->insert);
-	} else if (s->error && s->recoverable) {
-		/* The cache read failed, but we can retry direct to the
-		 * backing device. */
-		struct bio *bio = s->bio;
-		int i;
-
-		s->error = 0;
-
-		/* XXX: invalidate cache */
-
-		pr_debug("recovering at sector %llu",
-			 (uint64_t) s->bio_saved.bi_sector);
-
-		/* We only recover bios that use whole pages. */
-		bio->bi_sector	= s->bio_saved.bi_sector;
-		bio->bi_next	= NULL;
-		bio->bi_bdev	= s->d->bdev;
-		bio->bi_flags	= s->bio_saved.bi_flags;
-		bio->bi_rw	= s->bio_saved.bi_rw;
-		bio->bi_idx	= s->bio_saved.bi_idx;
-		bio->bi_size	= (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE;
-
-		bio->bi_end_io	= request_endio;
-		bio->bi_private	= s;
-
-		bio_for_each_segment(bv, bio, i)
-			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
-
-		pr_debug("recovering from failed cache read %llu, %i pages",
-			 (uint64_t) bio->bi_sector, bio->bi_vcnt);
-
-		closure_get(&s->cl);
-		bio_get(bio);
-		generic_make_request(bio);
-	}
-
-	return_f(cl, bio_complete);
-}
-
 static void check_should_skip(struct search *s)
 {
 	struct hlist_head *iohash(uint64_t k)
@@ -5590,6 +5518,78 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 
 	closure_get(&s->cl);
 	submit_bio(READ, bio);
+}
+
+static void request_read_done(struct closure *cl)
+{
+	struct search *s = container_of(cl, struct search, cl);
+	struct bio_vec *bv;
+	struct bkey *k;
+
+	while ((k = keylist_pop(&s->keys)))
+		__bkey_put(s->d->c, k);
+
+	if (!s->lookup_done) {
+		closure_init(&s->insert, &s->cl);
+		return_f(&s->insert, __request_read);
+	}
+
+	if (s->cache_bio && !s->error && !atomic_read(&s->d->c->closing)) {
+		bv = bio_iovec_idx(s->cache_bio, s->pages_from);
+
+		while (s->pages_from) {
+			struct page *p = alloc_page(__GFP_NOWARN|GFP_NOIO);
+			if (!p)
+				goto insert;
+
+			s->pages_from--, bv--;
+
+			memcpy(page_address(p), kmap(bv->bv_page), PAGE_SIZE);
+			kunmap(bv->bv_page);
+			bv->bv_page = p;
+		}
+
+		__bio_complete(s);
+insert:
+		closure_init(&s->insert, &s->cl);
+		bio_insert(&s->insert);
+	} else if (s->error && s->recoverable) {
+		/* The cache read failed, but we can retry direct to the
+		 * backing device. */
+		struct bio *bio = s->bio;
+		int i;
+
+		s->error = 0;
+
+		/* XXX: invalidate cache */
+
+		pr_debug("recovering at sector %llu",
+			 (uint64_t) s->bio_saved.bi_sector);
+
+		/* We only recover bios that use whole pages. */
+		bio->bi_sector	= s->bio_saved.bi_sector;
+		bio->bi_next	= NULL;
+		bio->bi_bdev	= s->d->bdev;
+		bio->bi_flags	= s->bio_saved.bi_flags;
+		bio->bi_rw	= s->bio_saved.bi_rw;
+		bio->bi_idx	= s->bio_saved.bi_idx;
+		bio->bi_size	= (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE;
+
+		bio->bi_end_io	= request_endio;
+		bio->bi_private	= s;
+
+		bio_for_each_segment(bv, bio, i)
+			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
+
+		pr_debug("recovering from failed cache read %llu, %i pages",
+			 (uint64_t) bio->bi_sector, bio->bi_vcnt);
+
+		closure_get(&s->cl);
+		bio_get(bio);
+		generic_make_request(bio);
+	}
+
+	return_f(cl, bio_complete);
 }
 
 static void __request_read(struct closure *cl)

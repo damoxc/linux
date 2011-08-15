@@ -5704,7 +5704,8 @@ static void prio_io(struct cache *c, uint64_t bucket, unsigned long rw)
 static void prio_write_done(struct closure *cl)
 {
 	struct cache *c = container_of(cl, struct cache, prio);
-	pr_debug("");
+	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
+		 fifo_used(&c->free_inc), fifo_used(&c->btree_freed));
 
 	spin_lock(&c->set->bucket_lock);
 
@@ -5778,7 +5779,8 @@ static void prio_write(struct cache *c, struct closure *cl)
 	atomic_set(&c->prio_written, -1);
 	closure_put(&c->prio, system_wq);
 
-	pr_debug("starting prio write");
+	pr_debug("free %zu, free_inc %zu, unused %zu", fifo_used(&c->free),
+		 fifo_used(&c->free_inc), fifo_used(&c->btree_freed));
 }
 
 static int prio_read(struct cache *c, uint64_t bucket)

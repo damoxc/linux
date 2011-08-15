@@ -7,11 +7,18 @@
 #include <linux/kernel.h>
 #include <linux/workqueue.h>
 
-#define USHRT_MAX	((uint16_t) ~0)
+#ifndef USHRT_MAX
+#define USHRT_MAX	((u16)(~0U))
+#define SHRT_MAX	((s16)(USHRT_MAX>>1))
+#endif
+
+#ifndef REQ_WRITE
 #define REQ_WRITE	WRITE
 #define REQ_SYNC	(1U << BIO_RW_SYNCIO)
 #define REQ_UNPLUG	(1U << BIO_RW_UNPLUG)
 #define REQ_META	(1U << BIO_RW_META)
+#endif
+
 extern struct workqueue_struct *system_wq;
 
 #define PAGE_SECTORS		(PAGE_SIZE / 512)

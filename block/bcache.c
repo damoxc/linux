@@ -6951,6 +6951,30 @@ static int bcache_make_request(struct request_queue *q, struct bio *bio)
 		: request_read(s);
 }
 
+static int bcache_congested(void *data, int bits)
+{
+	struct cached_dev *d = data;
+	struct request_queue *q;
+	int ret = 0;
+
+	q = bdev_get_queue(d->bdev);
+	if (bdi_congested(&q->backing_dev_info, bits))
+		return 1;
+
+	if (atomic_inc_not_zero(&d->count)) {
+		struct cache *ca;
+
+		for_each_cache(ca, d->c) {
+			q = bdev_get_queue(ca->bdev);
+			ret |= bdi_congested(&q->backing_dev_info, bits);
+		}
+
+		cached_dev_put(d);
+	}
+
+	return ret;
+}
+
 static void bcache_unplug(struct request_queue *q)
 {
 	struct cached_dev *d = q->queuedata;
@@ -7011,6 +7035,9 @@ static const char *register_bdev(struct cache_sb *sb, struct page *sb_page,
 	d->disk->queue->limits.logical_block_size  = block_bytes(d);
 	d->disk->queue->limits.physical_block_size = block_bytes(d);
 	set_bit(QUEUE_FLAG_NONROT, &d->disk->queue->queue_flags);
+
+	d->disk->queue->backing_dev_info.congested_fn = bcache_congested;
+	d->disk->queue->backing_dev_info.congested_data = d;
 
 	err = "error creating kobject";
 	if (register_dev_kobj(d))

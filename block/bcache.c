@@ -648,6 +648,14 @@ struct keylist {
 	uint64_t		d[KEYLIST_INLINE];
 };
 
+struct bbio {
+	union {
+		struct bkey	*key;
+		uint64_t	_pad[3];
+	};
+	struct bio		bio;
+};
+
 struct btree_op {
 	struct closure		cl;
 	struct cached_dev	*d;
@@ -679,17 +687,9 @@ struct search {
 
 	struct task_struct	*task;
 
-	struct bio		*bio;
+	struct bio		*orig_bio;
 	struct bio		*cache_bio;
-
-	struct {
-		sector_t	bi_sector;
-		unsigned long	bi_flags;
-		unsigned long	bi_rw;
-		unsigned short	bi_idx;
-		bio_end_io_t	*bi_end_io;
-		void		*bi_private;
-	} bio_saved;
+	struct bbio		bio;
 
 	struct btree_op		op;
 
@@ -741,7 +741,6 @@ static int __btree_write(struct btree *);
 static void __btree_sort(struct btree *, int, struct bset *,
 			 struct btree_iter *, bool);
 static void read_dirty(struct cached_dev *);
-static void queue_writeback(struct cached_dev *);
 static void prio_write(struct cache *, struct closure *);
 static void write_bdev_super(struct cached_dev *, struct closure *);
 static bool cache_set_error(struct cache_set *, const char *, ...);
@@ -750,10 +749,9 @@ static void do_discard(struct cache *);
 static void cache_read_endio(struct bio *, int);
 static void __request_read(struct closure *);
 static void __bio_complete(struct search *);
-static void btree_journal(struct closure *);
 static bool journal_full(struct cache_set *c);
 static void bio_insert(struct closure *);
-static void btree_invalidate(struct search *);
+static void bio_invalidate(struct search *);
 static void set_new_root(struct btree *);
 static void btree_journal_wait(struct cache_set *, struct closure *);
 static inline void cached_dev_put(struct cached_dev *);
@@ -787,9 +785,9 @@ static void bkey_copy_key(struct bkey *, const struct bkey *);
 #define prio_buckets(c)					\
 	DIV_ROUND_UP((c)->sb.nbuckets, prios_per_bucket(c))
 
-#define JSET_MAGIC	0x245235c1a3625032
-#define PSET_MAGIC	0x6750e15f87337f91
-#define BSET_MAGIC	0x90135c78b99e07f5
+#define JSET_MAGIC		0x245235c1a3625032
+#define PSET_MAGIC		0x6750e15f87337f91
+#define BSET_MAGIC		0x90135c78b99e07f5
 
 #define jset_magic(c)		((c)->sb.set_magic ^ JSET_MAGIC)
 #define pset_magic(c)		((c)->sb.set_magic ^ PSET_MAGIC)
@@ -862,9 +860,6 @@ KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
 
 #define PTR_BUCKET(c, k, n)						\
 	(PTR_CACHE(c, k, n)->buckets + PTR_BUCKET_NR(c, k, n))
-
-#define bio_split_c(bio, len, c)					\
-	bio_split_front(bio, len, GFP_NOIO, (c)->bio_split)
 
 /* Error handling macros */
 
@@ -1551,17 +1546,28 @@ static bool keylist_empty(struct keylist *l)
 
 static void btree_op_init(struct btree_op *op)
 {
-	memset(op, 0, sizeof(struct btree_op));
 	keylist_init(&op->keys);
-
-	op->lock	= -1;
+	op->lock = -1;
 
 }
 
 static void btree_op_init_stack(struct btree_op *op)
 {
+	memset(op, 0, sizeof(struct btree_op));
 	btree_op_init(op);
 	closure_init_stack(&op->cl);
+}
+
+static struct bio *bio_split_get(struct bio *bio, int len, struct cache_set *c)
+{
+	struct bio *ret = bio_split_front(bio, len, GFP_NOIO, c->bio_split);
+
+	if (ret && ret != bio) {
+		closure_get(ret->bi_private);
+		ret->bi_rw &= ~REQ_UNPLUG;
+	}
+
+	return ret;
 }
 
 /* Bucket heap / gen */
@@ -3045,7 +3051,7 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	sector += KEY_SIZE(k) - k->key + PTR_OFFSET(k, 0);
 	sectors = min(sectors, __bio_max_sectors(bio, bdev, sector));
 
-	ret = bio_split_c(bio, sectors, b->c);
+	ret = bio_split_get(bio, sectors, b->c);
 	if (!ret) {
 		atomic_dec_bug(&g->pin);
 		return ERR_PTR(-ENOMEM);
@@ -3054,11 +3060,6 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	ret->bi_sector	= sector;
 	ret->bi_bdev	= bdev;
 	ret->bi_end_io	= cache_read_endio;
-
-	if (ret != bio) {
-		closure_get(ret->bi_private);
-		ret->bi_rw &= ~REQ_UNPLUG;
-	}
 
 	/* For multiple cache devices, copy only the pointer we're actually
 	 * reading from
@@ -3079,13 +3080,13 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	return ret;
 }
 
-#define SEARCH(s) KEY(s->op.d->id, s->bio->bi_sector, 0)
+#define SEARCH(op, bio) KEY((op)->d->id, (bio)->bi_sector, 0)
 
 static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 {
-	struct bio *n;
+	struct bio *n, *bio = &s->bio.bio;
 	struct btree_iter iter;
-	btree_iter_init(b, &iter, &SEARCH(s));
+	btree_iter_init(b, &iter, &SEARCH(&s->op, bio));
 
 	while (1) {
 		struct bkey *k = btree_iter_next(&iter);
@@ -3095,28 +3096,27 @@ static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 		if (ptr_bad(b, k))
 			continue;
 
-		if (bio_end(s->bio) <= KEY_START(k)) {
+		if (bio_end(bio) <= KEY_START(k)) {
 			*reada = min(*reada, KEY_START(k));
 			return 0;
 		}
 
-		while (s->bio->bi_sector < KEY_START(k)) {
-			int sectors = min_t(int, bio_max_sectors(s->bio),
-					    KEY_START(k) - s->bio->bi_sector);
+		while (bio->bi_sector < KEY_START(k)) {
+			int sectors = min_t(int, bio_max_sectors(bio),
+					    KEY_START(k) - bio->bi_sector);
 
-			n = bio_split_c(s->bio, sectors, b->c);
+			n = bio_split_get(bio, sectors, b->c);
 			if (!n)
 				return -ENOMEM;
 
-			BUG_ON(n == s->bio);
-			closure_get(&s->cl);
+			BUG_ON(n == bio);
 			generic_make_request(n);
 		}
 
 		pr_debug("%s", pkey(k));
 
 		do {
-			n = cache_hit(b, s->bio, k, &s->op);
+			n = cache_hit(b, bio, k, &s->op);
 			if (!n)
 				break;
 			if (IS_ERR(n))
@@ -3124,11 +3124,11 @@ static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 
 			generic_make_request(n);
 
-			if (n == s->bio) {
+			if (n == bio) {
 				s->cache_hit = true;
 				return 0;
 			}
-		} while (s->bio->bi_sector < k->key);
+		} while (bio->bi_sector < k->key);
 	}
 }
 
@@ -3136,7 +3136,8 @@ static int btree_search_recurse(struct btree *b, struct search *s,
 				uint64_t *reada)
 {
 	int ret = -1;
-	struct bkey search = SEARCH(s), *k = &search;
+	struct bio *bio = &s->bio.bio;
+	struct bkey search = SEARCH(&s->op, bio), *k = &search;
 
 	pr_debug("at %s searching for %llu", pbtree(b), search.key);
 
@@ -3148,7 +3149,7 @@ static int btree_search_recurse(struct btree *b, struct search *s,
 
 		if (ret ||
 		    s->cache_hit ||
-		    bkey_cmp(k, &KEY(s->op.d->id, bio_end(s->bio), 0)) >= 0)
+		    bkey_cmp(k, &KEY(s->op.d->id, bio_end(bio), 0)) >= 0)
 			return ret;
 	}
 
@@ -4145,7 +4146,7 @@ static void btree_insert_async(struct closure *cl)
 	struct search *s = container_of(op, struct search, op);
 
 	if (s->bio_done &&
-	    s->op.insert_type == INSERT_READ)
+	    op->insert_type == INSERT_READ)
 		__bio_complete(s);
 again:
 	if (__btree_insert_async(op, op->d->c)) {
@@ -4154,7 +4155,7 @@ again:
 	}
 
 	if (s->skip && !s->bio_done) {
-		btree_invalidate(s);
+		bio_invalidate(s);
 		goto again;
 	}
 
@@ -4162,37 +4163,13 @@ again:
 		 ? bio_insert : NULL);
 }
 
-static void btree_invalidate(struct search *s)
-{
-	struct bio *bio = s->cache_bio;
-
-	pr_debug("invalidating %i sectors from %llu",
-		 bio_sectors(bio), (uint64_t) bio->bi_sector);
-
-	s->op.cl.fn = btree_journal;
-
-	while (bio_sectors(bio)) {
-		unsigned len = min(bio_sectors(bio), 1U << 14);
-		if (keylist_realloc(&s->op.keys, 0))
-			return;
-
-		bio->bi_sector	+= len;
-		bio->bi_size	-= len << 9;
-
-		keylist_add(&s->op.keys,
-			    &KEY(s->op.d->id, bio->bi_sector, len));
-	}
-
-	s->bio_done = true;
-}
-
 /* Journalling */
 
 static void btree_journal_read_endio(struct bio *bio, int error)
 {
-	struct closure *c = bio->bi_private;
+	struct closure *cl = bio->bi_private;
 	bio_put(bio);
-	closure_put(c, delayed);
+	closure_put(cl, delayed);
 }
 
 static int btree_journal_read(struct cache_set *s, struct list_head *list,
@@ -4666,13 +4643,12 @@ static void btree_journal_meta(struct cache_set *c, struct closure *cl)
 static void btree_journal(struct closure *cl)
 {
 	struct btree_op *op = container_of(cl, struct btree_op, cl);
-	struct search *s = container_of(op, struct search, op);
-	struct cache_set *c = s->op.d->c;
+	struct cache_set *c = op->d->c;
 	struct journal_write *w;
-	size_t b, n = ((uint64_t *) s->op.keys.top) - s->op.keys.list;
+	size_t b, n = ((uint64_t *) op->keys.top) - op->keys.list;
 
-	if (!(s->op.insert_type & INSERT_WRITE) ||
-	    !CACHE_SYNC(&s->op.d->c->sb))
+	if (!(op->insert_type & INSERT_WRITE) ||
+	    !CACHE_SYNC(&c->sb))
 		goto out;
 
 	spin_lock(&c->journal.lock);
@@ -4700,17 +4676,17 @@ static void btree_journal(struct closure *cl)
 		return_f(cl, btree_journal);
 	}
 
-	memcpy(end(w->data), s->op.keys.list, n * sizeof(uint64_t));
+	memcpy(end(w->data), op->keys.list, n * sizeof(uint64_t));
 	w->data->keys += n;
 	w->need_write = true;
 
-	s->op.journal = &fifo_back(&c->journal.pin);
-	atomic_inc(s->op.journal);
+	op->journal = &fifo_back(&c->journal.pin);
+	atomic_inc(op->journal);
 
 	/* XXX: if bio_insert doesn't finish on the first loop through this may
 	 * bug
 	 */
-	BUG_ON(!closure_wait(&w->wait, &s->cl));
+	BUG_ON(!closure_wait(&w->wait, cl->parent));
 
 	btree_journal_try_write(c);
 out:
@@ -5213,33 +5189,35 @@ found:
 
 static void bio_insert_endio(struct bio *bio, int error)
 {
-	struct search *s = bio->bi_private;
+	struct closure *cl = bio->bi_private;
 
 	if (error) {
-		cache_set_error(s->op.d->c, "writing data to cache");
-		if (s->op.insert_type == INSERT_WRITEBACK)
-			s->error = error;
+		struct btree_op *op = container_of(cl, struct btree_op, cl);
 
-		if (s->op.insert_type == INSERT_WRITE) {
+		cache_set_error(op->d->c, "writing data to cache");
+		if (op->insert_type == INSERT_WRITEBACK)
+			container_of(op, struct search, op)->error = error;
+
+		if (op->insert_type == INSERT_WRITE) {
 			/* XXX: technically racy, if bio_insert() split and
 			 * there was more than one error - should set
 			 * s->insert.fn to something else
 			 */
-			for (struct bkey *k = s->op.keys.bottom;
-			     k < s->op.keys.top;
+			for (struct bkey *k = op->keys.bottom;
+			     k < op->keys.top;
 			     k = next(k)) {
 				void *p = next(k);
-				size_t len = p - (void *) s->op.keys.top;
+				size_t len = p - (void *) op->keys.top;
 
 				SET_KEY_PTRS(k, 0);
 				memmove(next(k), p, len);
 			}
 		} else
-			s->op.cl.fn = NULL;
+			cl->fn = NULL;
 	}
 
 	bio_put(bio);
-	closure_put(&s->op.cl, delayed);
+	closure_put(cl, delayed);
 }
 
 static void bio_insert(struct closure *cl)
@@ -5250,7 +5228,7 @@ static void bio_insert(struct closure *cl)
 	unsigned sectors = bio_sectors(bio);
 
 	bio->bi_end_io	= bio_insert_endio;
-	bio->bi_private = s;
+	bio->bi_private = cl;
 	bio_get(bio);
 
 	if (atomic_sub_return(bio_sectors(bio), &op->d->c->sectors_to_gc) < 0) {
@@ -5262,10 +5240,10 @@ static void bio_insert(struct closure *cl)
 		struct open_bucket *b;
 		struct bkey *k;
 
-		if (keylist_realloc(&s->op.keys, 1))
+		if (keylist_realloc(&op->keys, 1))
 			return_f(cl, btree_journal);
 
-		k = s->op.keys.top;
+		k = op->keys.top;
 
 		b = get_data_bucket(&KEY(op->d->id, bio->bi_sector, 0), s);
 		if (!b)
@@ -5273,22 +5251,17 @@ static void bio_insert(struct closure *cl)
 
 		put_data_bucket(b, op->d->c, k, bio);
 
-		if (s->op.insert_type == INSERT_WRITEBACK)
+		if (op->insert_type == INSERT_WRITEBACK)
 			SET_KEY_DIRTY(k, true);
 
-		n = bio_split_c(bio, KEY_SIZE(k), op->d->c);
+		n = bio_split_get(bio, KEY_SIZE(k), op->d->c);
 		if (!n) {
 			__bkey_put(op->d->c, k);
 			return_f(cl, bio_insert);
 		}
 
-		if (n != bio) {
-			closure_get(cl);
-			n->bi_rw &= ~REQ_UNPLUG;
-		}
-
 		pr_debug("%s", pkey(k));
-		keylist_push(&s->op.keys);
+		keylist_push(&op->keys);
 
 		cl->fn = btree_journal;
 
@@ -5306,7 +5279,7 @@ static void bio_insert(struct closure *cl)
 
 	return;
 err:
-	switch (s->op.insert_type) {
+	switch (op->insert_type) {
 	case INSERT_WRITEBACK:
 		BUG();
 		/* Lookup in in_writeback rb tree, wait on appropriate
@@ -5315,36 +5288,59 @@ err:
 		 */
 		s->bio_done = true;
 		/* will call bio_insert_endio()... */
-		bio_endio(s->bio, -ENOMEM);
+		bio_endio(bio, -ENOMEM);
 		break;
 	case INSERT_WRITE:
 		s->skip = true;
-		btree_invalidate(s);
-		bio_endio(s->cache_bio, 0);
+		bio_invalidate(s);
+		bio_endio(bio, 0);
 		break;
 	case INSERT_READ:
 		s->bio_done = true;
-		bio_endio(s->cache_bio, 0);
+		bio_endio(bio, 0);
 	}
 
 	pr_debug("error for %s, %i/%i sectors done, bi_sector %llu",
-		 insert_type(&s->op), sectors - bio_sectors(bio), sectors,
+		 insert_type(op), sectors - bio_sectors(bio), sectors,
 		 (uint64_t) bio->bi_sector);
+}
+
+static void bio_invalidate(struct search *s)
+{
+	struct bio *bio = s->cache_bio;
+
+	pr_debug("invalidating %i sectors from %llu",
+		 bio_sectors(bio), (uint64_t) bio->bi_sector);
+
+	s->op.cl.fn = btree_journal;
+
+	while (bio_sectors(bio)) {
+		unsigned len = min(bio_sectors(bio), 1U << 14);
+		if (keylist_realloc(&s->op.keys, 0))
+			return;
+
+		bio->bi_sector	+= len;
+		bio->bi_size	-= len << 9;
+
+		keylist_add(&s->op.keys,
+			    &KEY(s->op.d->id, bio->bi_sector, len));
+	}
+
+	s->bio_done = true;
 }
 
 /* Process a bio */
 
 static void __bio_complete(struct search *s)
 {
-	if (s->bio && s->bio_saved.bi_end_io) {
+	if (s->orig_bio) {
 		if (s->error)
-			clear_bit(BIO_UPTODATE, &s->bio->bi_flags);
+			clear_bit(BIO_UPTODATE, &s->orig_bio->bi_flags);
 
-		s->bio->bi_private	= s->bio_saved.bi_private;
-		s->bio->bi_end_io	= s->bio_saved.bi_end_io;
-		s->bio->bi_end_io(s->bio, s->error);
+		if (s->orig_bio->bi_end_io)
+			s->orig_bio->bi_end_io(s->orig_bio, s->error);
+		s->orig_bio = NULL;
 	}
-	s->bio = NULL;
 }
 
 static void bio_complete(struct closure *cl)
@@ -5379,21 +5375,24 @@ static void bio_complete(struct closure *cl)
 
 static void request_endio(struct bio *bio, int error)
 {
-	struct search *s = bio->bi_private;
+	struct closure *cl = bio->bi_private;
+
 	if (error) {
+		struct search *s = container_of(cl, struct search, cl);
 		s->error = error;
 		/* Only cache read errors are recoverable */
 		s->recoverable = false;
 	}
 
 	bio_put(bio);
-	closure_put(&s->cl, delayed);
+	closure_put(cl, delayed);
 }
 
 static void cache_read_endio(struct bio *bio, int error)
 {
-	struct search *s = bio->bi_private;
 	if (error) {
+		struct closure *cl = bio->bi_private;
+		struct search *s = container_of(cl, struct search, cl);
 		s->error = error;
 		cache_set_error(s->op.d->c, "reading from cache");
 	}
@@ -5403,9 +5402,11 @@ static void cache_read_endio(struct bio *bio, int error)
 
 static void readahead_endio(struct bio *bio, int error)
 {
-	struct search *s = bio->bi_private;
+	struct closure *cl = bio->bi_private;
+
 	if (error) {
 		/* XXX: record stat */
+		struct search *s = container_of(cl, struct search, cl);
 		struct bio *p = xchg(&s->cache_bio, NULL);
 		if (p)
 			bio_put(p);
@@ -5420,14 +5421,15 @@ static void check_should_skip(struct search *s)
 	{ return &s->op.d->io_hash[hash_64(k, RECENT_IO_BITS)]; }
 
 	struct io t = { .sequential = 0 }, *i = &t;
+	struct bio *bio = &s->bio.bio;
 	unsigned avg;
 
 	if (atomic_read(&s->op.d->closing) ||
 	    s->op.d->c->gc_stats.in_use > CUTOFF_CACHE_ADD)
 		goto skip;
 
-	if (s->bio->bi_sector   % s->op.d->c->sb.block_size ||
-	    bio_sectors(s->bio) % s->op.d->c->sb.block_size) {
+	if (bio->bi_sector   % s->op.d->c->sb.block_size ||
+	    bio_sectors(bio) % s->op.d->c->sb.block_size) {
 		pr_debug("skipping unaligned io");
 		goto skip;
 	}
@@ -5437,7 +5439,7 @@ static void check_should_skip(struct search *s)
 		goto rescale;
 
 	if (s->op.insert_type & INSERT_WRITE &&
-	    (s->op.d->writeback && (s->bio->bi_rw & REQ_SYNC)))
+	    (s->op.d->writeback && (bio->bi_rw & REQ_SYNC)))
 		goto rescale;
 
 	spin_lock(&s->op.d->lock);
@@ -5445,8 +5447,8 @@ static void check_should_skip(struct search *s)
 	if (s->op.d->sequential_merge) {
 		struct hlist_node *cursor;
 
-		hlist_for_each_entry(i, cursor, iohash(s->bio->bi_sector), hash)
-			if (i->last == s->bio->bi_sector &&
+		hlist_for_each_entry(i, cursor, iohash(bio->bi_sector), hash)
+			if (i->last == bio->bi_sector &&
 			    time_before(jiffies, i->jiffies))
 				goto found;
 
@@ -5454,7 +5456,7 @@ static void check_should_skip(struct search *s)
 		i->sequential = 0;
 		s->task->nr_ios++;
 found:
-		i->last = bio_end(s->bio);
+		i->last = bio_end(bio);
 
 		hlist_del(&i->hash);
 		hlist_add_head(&i->hash, iohash(i->last));
@@ -5465,7 +5467,7 @@ found:
 	i->jiffies = jiffies + msecs_to_jiffies(5000);
 
 	if (s->op.d->sequential_cutoff_average) {
-		s->task->sequential_io += bio_sectors(s->bio);
+		s->task->sequential_io += bio_sectors(bio);
 
 		avg = s->task->sequential_io / (s->task->nr_ios + 1);
 		if (avg > s->op.d->sequential_cutoff_average >> 9)
@@ -5473,7 +5475,7 @@ found:
 	}
 
 	if (s->op.d->sequential_cutoff) {
-		i->sequential += bio_sectors(s->bio);
+		i->sequential += bio_sectors(bio);
 
 		if (i->sequential >= s->op.d->sequential_cutoff >> 9)
 			goto skip_unlock;
@@ -5481,13 +5483,24 @@ found:
 
 	spin_unlock(&s->op.d->lock);
 rescale:
-	rescale_heap(s->op.d->c, bio_sectors(s->bio));
+	rescale_heap(s->op.d->c, bio_sectors(bio));
 	return;
 skip_unlock:
 	spin_unlock(&s->op.d->lock);
 skip:
-	atomic_long_add(bio_sectors(s->bio), &s->op.d->sectors_bypassed);
+	atomic_long_add(bio_sectors(bio), &s->op.d->sectors_bypassed);
 	s->skip = true;
+}
+
+static void __do_bio_hook(struct search *s)
+{
+	struct bio *bio = &s->bio.bio;
+	memcpy(bio, s->orig_bio, sizeof(struct bio));
+
+	bio->bi_end_io		= request_endio;
+	bio->bi_private		= &s->cl;
+	bio->bi_destructor	= NULL;
+	atomic_set(&bio->bi_cnt, 2);
 }
 
 static struct search *do_bio_hook(struct bio *bio, struct cached_dev *d)
@@ -5500,25 +5513,14 @@ static struct search *do_bio_hook(struct bio *bio, struct cached_dev *d)
 
 	s->op.d			= d;
 	s->task			= get_current();
-	s->bio			= bio;
+	s->orig_bio		= bio;
 	s->pages_from		= USHRT_MAX;
-	s->cl.fn		= bio_complete;
-
-	s->bio_saved.bi_sector	= bio->bi_sector;
-	s->bio_saved.bi_flags	= bio->bi_flags;
-	s->bio_saved.bi_rw	= bio->bi_rw;
-	s->bio_saved.bi_idx	= bio->bi_idx;
-	s->bio_saved.bi_end_io	= bio->bi_end_io;
-	s->bio_saved.bi_private	= bio->bi_private;
-
-	bio->bi_end_io		= request_endio;
-	bio->bi_private		= s;
-	bio_get(bio);
 
 	/* We only recover bios that use whole pages. */
 	if (bio->bi_size == (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE)
 		s->recoverable = 1;
 
+	__do_bio_hook(s);
 	return s;
 }
 
@@ -5554,7 +5556,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 	bio->bi_size	= sectors << 9;
 
 	bio->bi_end_io	= readahead_endio;
-	bio->bi_private	= s;
+	bio->bi_private	= &s->cl;
 
 	bio_map(bio, NULL);
 	if (bio_alloc_pages(bio, __GFP_NOWARN|GFP_NOIO)) {
@@ -5612,37 +5614,22 @@ insert:
 	} else if (s->error && s->recoverable) {
 		/* The cache read failed, but we can retry direct to the
 		 * backing device. */
-		struct bio *bio = s->bio;
 		int i;
 
+		pr_debug("recovering at sector %llu",
+			 (uint64_t) s->orig_bio->bi_sector);
+
 		s->error = 0;
+		__do_bio_hook(s);
 
 		/* XXX: invalidate cache */
 
-		pr_debug("recovering at sector %llu",
-			 (uint64_t) s->bio_saved.bi_sector);
-
 		/* We only recover bios that use whole pages. */
-		bio->bi_sector	= s->bio_saved.bi_sector;
-		bio->bi_next	= NULL;
-		bio->bi_bdev	= s->op.d->bdev;
-		bio->bi_flags	= s->bio_saved.bi_flags;
-		bio->bi_rw	= s->bio_saved.bi_rw;
-		bio->bi_idx	= s->bio_saved.bi_idx;
-		bio->bi_size	= (bio->bi_vcnt - bio->bi_idx) * PAGE_SIZE;
-
-		bio->bi_end_io	= request_endio;
-		bio->bi_private	= s;
-
-		bio_for_each_segment(bv, bio, i)
+		bio_for_each_segment(bv, &s->bio.bio, i)
 			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
 
-		pr_debug("recovering from failed cache read %llu, %i pages",
-			 (uint64_t) bio->bi_sector, bio->bi_vcnt);
-
 		closure_get(&s->cl);
-		bio_get(bio);
-		generic_make_request(bio);
+		generic_make_request(&s->bio.bio);
 	}
 
 	return_f(cl, bio_complete);
@@ -5652,7 +5639,8 @@ static void __request_read(struct closure *cl)
 {
 	struct btree_op *op = container_of(cl, struct btree_op, cl);
 	struct search *s = container_of(op, struct search, op);
-	uint64_t reada = s->bio->bi_bdev->bd_inode->i_size;
+	struct bio *bio = &s->bio.bio;
+	uint64_t reada = bio->bi_bdev->bd_inode->i_size;
 
 	int ret = btree_root(search_recurse, op->d->c, op, s, &reada);
 
@@ -5668,14 +5656,14 @@ static void __request_read(struct closure *cl)
 
 	if (!s->cache_hit) {
 		reada = min_t(uint64_t, reada,
-			      s->bio->bi_sector + (op->d->readahead >> 9));
+			      bio->bi_sector + (op->d->readahead >> 9));
 
 		if (!s->skip)
-			do_readahead(s, s->bio, reada - bio_end(s->bio));
+			do_readahead(s, bio, reada - bio_end(bio));
 
 		BUG_ON(s->cache_bio && !s->cache_bio->bi_size);
 
-		generic_make_request(s->bio);
+		generic_make_request(bio);
 		atomic_long_inc(&op->d->cache_misses);
 	} else
 		atomic_long_inc(&op->d->cache_hits);
@@ -5683,62 +5671,60 @@ static void __request_read(struct closure *cl)
 	return_f(cl, NULL);
 }
 
-static int request_read(struct search *s)
+static void request_read(struct search *s)
 {
 	s->cl.fn		= request_read_done;
 	s->op.insert_type	= INSERT_READ;
 	check_should_skip(s);
 
 	__request_read(&s->op.cl);
-	return 0;
 }
 
-static int request_write(struct search *s)
+static void request_write(struct search *s)
 {
-	down_read_non_owner(&s->op.d->writeback_lock);
-	s->op.insert_type = INSERT_WRITE;
-	check_should_skip(s);
+	struct bio *bio = &s->bio.bio;
 
-	if (in_writeback(s->op.d, s->bio->bi_sector, bio_sectors(s->bio))) {
+	s->cl.fn		= bio_complete;
+	s->op.insert_type	= INSERT_WRITE;
+	check_should_skip(s);
+	down_read_non_owner(&s->op.d->writeback_lock);
+
+	if (in_writeback(s->op.d, bio->bi_sector, bio_sectors(bio))) {
 		s->skip = false;
 		s->op.insert_type = INSERT_WRITEBACK;
 	}
 
 	if (s->skip) {
-skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
-						s->op.d->c->bio_split);
-		s->cache_bio->bi_sector = s->bio->bi_sector;
-		s->cache_bio->bi_size	= s->bio->bi_size;
-		s->cache_bio->bi_flags |= 1 << BIO_HAS_POOL;
-		s->cache_bio->bi_destructor = (void *) s->op.d->c->bio_split;
+skip:		s->cache_bio = s->orig_bio;
+		bio_get(s->cache_bio);
 
-		btree_invalidate(s);
+		bio_invalidate(s);
 		closure_put(&s->op.cl, delayed);
-		return 1;
+		generic_make_request(bio);
+		return;
 	}
 
 	if (s->op.d->writeback) {
 		int i = s->op.d->c->gc_stats.in_use;
 		if (i < CUTOFF_WRITEBACK ||
-		    (i < CUTOFF_WRITEBACK_SYNC && s->bio->bi_rw & REQ_SYNC))
+		    (i < CUTOFF_WRITEBACK_SYNC && bio->bi_rw & REQ_SYNC))
 			s->op.insert_type = INSERT_WRITEBACK;
 	}
 
 	if (s->op.insert_type == INSERT_WRITE) {
-		s->cache_bio = bio_kmalloc(GFP_NOIO, s->bio->bi_max_vecs);
+		s->cache_bio = bio_kmalloc(GFP_NOIO, bio->bi_max_vecs);
 		if (!s->cache_bio) {
 			s->skip = true;
 			goto skip;
 		}
 
-		__bio_clone(s->cache_bio, s->bio);
+		__bio_clone(s->cache_bio, bio);
 		bio_insert(&s->op.cl);
-		return 1;
+		generic_make_request(bio);
 	} else {
-		s->cache_bio = s->bio;
+		s->cache_bio = bio;
 		closure_put(&s->cl, delayed);
 		bio_insert(&s->op.cl);
-		return 0;
 	}
 }
 
@@ -6970,9 +6956,8 @@ static int bcache_make_request(struct request_queue *q, struct bio *bio)
 
 	s = do_bio_hook(bio, d);
 
-	return bio->bi_rw & REQ_WRITE
-		? request_write(s)
-		: request_read(s);
+	(bio->bi_rw & REQ_WRITE ? request_write : request_read)(s);
+	return 0;
 }
 
 static int bcache_congested(void *data, int bits)
@@ -7439,7 +7424,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	iter_size = (sb->bucket_size / sb->block_size + 1) *
 		sizeof(struct btree_iter_set);
 
-	if (!(c->bio_split = bioset_create(64, 0)) ||
+	if (!(c->bio_split = bioset_create(64, offsetof(struct bbio, bio))) ||
 	    !(c->fill_iter = kmalloc(iter_size, GFP_KERNEL)) ||
 	    !(c->sort = alloc_bucket_pages(GFP_KERNEL, c)) ||
 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||

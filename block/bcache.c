@@ -553,6 +553,10 @@ struct cached_dev {
 	uint64_t		last_read;
 	struct rb_root		dirty;
 
+	/* Beginning and end of range in dirty rb tree */
+	uint64_t		writeback_start;
+	uint64_t		writeback_end;
+
 	struct io		io[RECENT_IO];
 	struct hlist_head	io_hash[RECENT_IO + 1];
 	struct list_head	io_lru;
@@ -4899,6 +4903,18 @@ again:
 			atomic_long_set(&d->last_refilled, jiffies);
 	}
 
+	if (!RB_EMPTY_ROOT(&d->dirty)) {
+		struct dirty *w;
+		w = RB_FIRST(&d->dirty, struct dirty, node);
+		d->writeback_start	= KEY_START(&w->key);
+
+		w = RB_LAST(&d->dirty, struct dirty, node);
+		d->writeback_end	= w->key.key;
+	} else {
+		d->writeback_start	= 0;
+		d->writeback_end	= 0;
+	}
+
 	up_write(&d->writeback_lock);
 	closure_sync(&op.cl);
 
@@ -4909,6 +4925,10 @@ static bool in_writeback(struct cached_dev *d, sector_t offset, unsigned len)
 {
 	struct dirty *ret, s;
 	s.key = KEY(d->id, offset + len, len);
+
+	if (offset >= d->writeback_end ||
+	    offset + len <= d->writeback_start)
+		return false;
 
 	spin_lock(&d->lock);
 	ret = RB_SEARCH(&d->dirty, s, node, dirty_cmp);

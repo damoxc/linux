@@ -390,7 +390,12 @@ dup:									\
 
 void bio_reset(struct bio *bio);
 void bio_map(struct bio *bio, void *base);
-struct bio *bio_split_front(struct bio *, int, gfp_t, struct bio_set *);
+
+typedef struct bio *(bio_alloc_fn)(gfp_t, int);
+
+struct bio *bio_split_front(struct bio *, int, bio_alloc_fn *,
+			    gfp_t, struct bio_set *);
+
 int bio_submit_split(struct bio *bio, atomic_t *i, struct bio_set *bs);
 unsigned __bio_max_sectors(struct bio *bio, struct block_device *bdev,
 			   sector_t sector);

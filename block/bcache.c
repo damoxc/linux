@@ -52,8 +52,6 @@
 
 /*
  * Todo:
- * Sysfs var for how often priorities get written?
- *
  * register_bcache: Return errors out to userspace correctly
  *
  * Writeback: don't undirty key until after a cache flush
@@ -2319,11 +2317,6 @@ static unsigned count_data(struct btree *b)
 	return ret;
 }
 
-#define DUMP_BUCKET_BUG_ON(condition, b, ...) do {	\
-	if (condition)					\
-		dump_bucket_and_panic(b, __VA_ARGS__);	\
-} while (0)
-
 static void check_key_order_msg(struct btree *b, struct bset *i,
 				const char *m, ...)
 {
@@ -2343,7 +2336,6 @@ static void check_key_order_msg(struct btree *b, struct bset *i,
 #else /* EDEBUG */
 
 #define count_data(b)					0
-#define DUMP_BUCKET_BUG_ON(condition, b, ...)		BUG_ON(condition)
 #define check_key_order(b, i)				do {} while (0)
 #define check_key_order_msg(b, i, ...)			do {} while (0)
 
@@ -4048,7 +4040,7 @@ static int btree_split(struct btree *b, struct btree_op *op)
 	btree_sort(b, 0, n1->data);
 	bkey_copy_key(&n1->key, &b->key);
 
-	split = set_blocks(n1->data, n1->c) > (btree_blocks(b) * 3) / 4;
+	split = set_blocks(n1->data, n1->c) > (btree_blocks(b) * 4) / 5;
 	pr_debug("%ssplitting at %s keys %i", split ? "" : "not ",
 		 pbtree(b), n1->data->keys);
 
@@ -5563,35 +5555,49 @@ static void readahead_endio(struct bio *bio, int error)
 
 static void check_should_skip(struct search *s)
 {
+	void add_sequential(struct task_struct *t)
+	{
+		uint64_t avg = t->sequential_io_avg;
+
+		avg *= 7;
+		avg += t->sequential_io;
+		avg /= 8;
+
+		if (avg <= UINT_MAX)
+			t->sequential_io_avg = avg;
+
+		t->sequential_io = 0;
+	}
+
 	struct hlist_head *iohash(uint64_t k)
 	{ return &s->op.d->io_hash[hash_64(k, RECENT_IO_BITS)]; }
 
-	struct io t = { .sequential = 0 }, *i = &t;
+	struct cached_dev *d = s->op.d;
 	struct bio *bio = &s->bio.bio;
-	unsigned avg;
 
-	if (atomic_read(&s->op.d->closing) ||
-	    s->op.d->c->gc_stats.in_use > CUTOFF_CACHE_ADD)
+	if (atomic_read(&d->closing) ||
+	    d->c->gc_stats.in_use > CUTOFF_CACHE_ADD)
 		goto skip;
 
-	if (bio->bi_sector   % s->op.d->c->sb.block_size ||
-	    bio_sectors(bio) % s->op.d->c->sb.block_size) {
+	if (bio->bi_sector   % d->c->sb.block_size ||
+	    bio_sectors(bio) % d->c->sb.block_size) {
 		pr_debug("skipping unaligned io");
 		goto skip;
 	}
 
-	if (!s->op.d->sequential_cutoff &&
-	    !s->op.d->sequential_cutoff_average)
+	if (!d->sequential_cutoff &&
+	    !d->sequential_cutoff_average)
 		goto rescale;
 
 	if (s->op.insert_type & INSERT_WRITE &&
-	    (s->op.d->writeback && (bio->bi_rw & REQ_SYNC)))
+	    (d->writeback && (bio->bi_rw & REQ_SYNC)))
 		goto rescale;
 
-	spin_lock(&s->op.d->lock);
-
-	if (s->op.d->sequential_merge) {
+	if (d->sequential_merge) {
 		struct hlist_node *cursor;
+		struct io *i;
+
+		spin_lock(&d->lock);
 
 		hlist_for_each_entry(i, cursor, iohash(bio->bi_sector), hash)
 			if (i->last == bio->bi_sector &&
@@ -5599,42 +5605,41 @@ static void check_should_skip(struct search *s)
 				goto found;
 
 		i = list_first_entry(&s->op.d->io_lru, struct io, lru);
+
+		add_sequential(s->task);
 		i->sequential = 0;
-		s->task->nr_ios++;
 found:
-		i->last = bio_end(bio);
+		if (i->sequential + bio->bi_size > i->sequential)
+			i->sequential	+= bio->bi_size;
+
+		i->last			 = bio_end(bio);
+		i->jiffies		 = jiffies + msecs_to_jiffies(5000);
+		s->task->sequential_io	 = i->sequential;
 
 		hlist_del(&i->hash);
 		hlist_add_head(&i->hash, iohash(i->last));
-		list_move_tail(&i->lru, &s->op.d->io_lru);
-	} else
-		s->task->nr_ios++;
+		list_move_tail(&i->lru, &d->io_lru);
 
-	i->jiffies = jiffies + msecs_to_jiffies(5000);
+		spin_unlock(&d->lock);
+	} else {
+		s->task->sequential_io = bio->bi_size;
 
-	if (s->op.d->sequential_cutoff_average) {
-		s->task->sequential_io += bio_sectors(bio);
-
-		avg = s->task->sequential_io / (s->task->nr_ios + 1);
-		if (avg > s->op.d->sequential_cutoff_average >> 9)
-			goto skip_unlock;
+		add_sequential(s->task);
 	}
 
-	if (s->op.d->sequential_cutoff) {
-		i->sequential += bio_sectors(bio);
+	if (d->sequential_cutoff &&
+	    d->sequential_cutoff <= s->task->sequential_io)
+		goto skip;
 
-		if (i->sequential >= s->op.d->sequential_cutoff >> 9)
-			goto skip_unlock;
-	}
+	if (d->sequential_cutoff_average &&
+	    d->sequential_cutoff_average <= s->task->sequential_io_avg)
+		goto skip;
 
-	spin_unlock(&s->op.d->lock);
 rescale:
-	rescale_heap(s->op.d->c, bio_sectors(bio));
+	rescale_heap(d->c, bio_sectors(bio));
 	return;
-skip_unlock:
-	spin_unlock(&s->op.d->lock);
 skip:
-	atomic_long_add(bio_sectors(bio), &s->op.d->sectors_bypassed);
+	atomic_long_add(bio_sectors(bio), &d->sectors_bypassed);
 	s->skip = true;
 }
 

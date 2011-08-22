@@ -1577,8 +1577,8 @@ struct task_struct {
 	atomic_t ptrace_bp_refcnt;
 #endif
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
-	unsigned int	nr_ios;
 	unsigned int	sequential_io;
+	unsigned int	sequential_io_avg;
 #endif
 };
 

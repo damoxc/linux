@@ -408,6 +408,8 @@ struct cache_set {
 	atomic_long_t		writeback_keys_failed;
 	atomic_long_t		btree_write_count;
 	atomic_long_t		keys_write_count;
+	int			error_limit;
+	int			error_decay;
 
 #define BUCKET_HASH_BITS	12
 	struct hlist_head	bucket_hash[];
@@ -455,6 +457,10 @@ struct cache {
 	atomic_long_t		meta_sectors_written;
 	atomic_long_t		btree_sectors_written;
 	atomic_long_t		sectors_written;
+
+#define IO_ERROR_SHIFT		20
+	atomic_t		io_errors;
+	atomic_t		io_count;
 
 	bool			discard;
 	struct list_head	discards;
@@ -654,7 +660,7 @@ struct keylist {
 
 struct bbio {
 	union {
-		struct bkey	*key;
+		struct bkey	key;
 		uint64_t	_pad[3];
 	};
 	struct bio		bio;
@@ -747,8 +753,6 @@ static void __btree_sort(struct btree *, int, struct bset *,
 static void read_dirty(struct cached_dev *);
 static void prio_write(struct cache *, struct closure *);
 static void write_bdev_super(struct cached_dev *, struct closure *);
-static bool cache_set_error(struct cache_set *, const char *, ...);
-static void cache_io_error(struct cache *c, const char *m);
 static void do_discard(struct cache *);
 static void cache_read_endio(struct bio *, int);
 static void __request_read(struct closure *);
@@ -758,10 +762,12 @@ static void bio_insert(struct closure *);
 static void bio_invalidate(struct search *);
 static void set_new_root(struct btree *);
 static void btree_journal_wait(struct cache_set *, struct closure *);
-static inline void cached_dev_put(struct cached_dev *);
-static void cache_init_journal(struct cache *);
-static struct cache_set *alloc_cache_set(struct cache_sb *);
 static void bkey_copy_key(struct bkey *, const struct bkey *);
+
+static struct cache_set *alloc_cache_set(struct cache_sb *);
+static void cache_init_journal(struct cache *);
+static inline void cached_dev_put(struct cached_dev *);
+static bool cache_set_error(struct cache_set *, const char *, ...);
 
 #define btree_prio		((uint16_t) ~0)
 #define MAX_NEED_GC		64
@@ -865,29 +871,6 @@ KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
 #define PTR_BUCKET(c, k, n)						\
 	(PTR_CACHE(c, k, n)->buckets + PTR_BUCKET_NR(c, k, n))
 
-/* Error handling macros */
-
-#define cache_bug(b, ...)						\
-do {									\
-	if (__builtin_types_compatible_p(typeof(b), struct cache *)	\
-		? cache_error(((struct cache *) b), __VA_ARGS__)	\
-		: cache_set_error(((struct btree *) b)->c, __VA_ARGS__))\
-		dump_stack();						\
-} while (0)
-
-#define cache_set_err_on(cond, c, ...)					\
-	({ if (cond) cache_set_error(c, __VA_ARGS__); })
-
-#define cache_io_err_on(cond, c, m)					\
-	({ if (cond) cache_io_error(c, m); })
-
-#define cache_bug_on(cond, c, ...)					\
-	({ if (cond) cache_bug(c, __VA_ARGS__); })
-
-#define cache_error(c, ...)	cache_set_error(c->set, __VA_ARGS__)
-
-#define err_printk(...)	printk(KERN_ERR "bcache: " __VA_ARGS__)
-
 /* Looping macros */
 
 #define for_each_cache(c, s)						\
@@ -922,6 +905,25 @@ do {									\
 	for_each_key_after_filter(b, k, NULL, filter)
 
 #define for_each_key(b, k)	for_each_key_filter(b, k, all_keys)
+
+/* Error handling macros */
+
+#define btree_bug(b, ...)						\
+	({ if (cache_set_error((b)->c, __VA_ARGS__)) dump_stack(); })
+
+#define cache_bug(c, ...)						\
+	({ if (cache_set_error(c, __VA_ARGS__)) dump_stack(); })
+
+#define btree_bug_on(cond, b, ...)					\
+	({ if (cond) btree_bug(b, __VA_ARGS__); })
+
+#define cache_bug_on(cond, c, ...)					\
+	({ if (cond) cache_bug(c, __VA_ARGS__); })
+
+#define cache_set_err_on(cond, c, ...)					\
+	({ if (cond) cache_set_error(c, __VA_ARGS__); })
+
+#define err_printk(...)	printk(KERN_ERR "bcache: " __VA_ARGS__)
 
 /* Expensive checks */
 
@@ -1435,6 +1437,133 @@ static void bset_init(struct btree *b, struct bset *i)
 	i->keys		= 0;
 }
 
+/* Bios with headers */
+
+static void bbio_destructor(struct bio *bio)
+{
+	struct bbio *b = container_of(bio, struct bbio, bio);
+	kfree(b);
+}
+
+static struct bio *bbio_kmalloc(gfp_t gfp, int vecs)
+{
+	struct bio *bio;
+	struct bbio *b;
+
+	b = kmalloc(sizeof(struct bbio) + sizeof(struct bio_vec) * vecs, gfp);
+	if (!b)
+		return NULL;
+
+	bio = &b->bio;
+
+	bio_init(bio);
+	bio->bi_flags		|= BIO_POOL_NONE << BIO_POOL_OFFSET;
+	bio->bi_max_vecs	 = vecs;
+	bio->bi_io_vec		 = bio->bi_inline_vecs;
+	bio->bi_destructor	 = bbio_destructor;
+
+	return bio;
+}
+
+static struct bio *bio_split_get(struct bio *bio, int len, struct cache_set *c)
+{
+	struct bio *ret;
+	struct bio_set *bs = c->bio_split;
+
+	ret = bio_split_front(bio, len, bbio_kmalloc, GFP_NOIO, bs);
+
+	if (ret && ret != bio) {
+		closure_get(ret->bi_private);
+		ret->bi_rw &= ~REQ_UNPLUG;
+	}
+
+	return ret;
+}
+
+static void __submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
+{
+	struct bbio *b = container_of(bio, struct bbio, bio);
+
+	BUG_ON(bio->bi_destructor &&
+	       (bio->bi_destructor != bbio_destructor) &&
+	       (bio->bi_destructor != (void *) c->bio_split));
+	BUG_ON(KEY_PTRS(k) != 1);
+
+	bkey_copy(&b->key, k);
+
+	bio->bi_bdev = PTR_CACHE(c, k, 0)->bdev;
+
+	generic_make_request(bio);
+}
+
+static void submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
+{
+	bio->bi_sector = PTR_OFFSET(k, 0);
+
+	__submit_bbio(bio, c, k);
+}
+
+/* IO errors */
+
+static void count_io_errors(struct cache *c, int error, const char *m)
+{
+	/* The halflife of an error is:
+	 * log2(1/2)/log2(127/128) * refresh ~= 88 * refresh
+	 */
+	int n, errors, count = 0, refresh = c->set->error_decay;
+
+	if (refresh) {
+		count = atomic_inc_return(&c->io_count);
+		while (count > refresh) {
+			int old_count = count;
+			n = count - refresh;
+			count = atomic_cmpxchg(&c->io_count, old_count, n);
+			if (count == old_count) {
+				int old_errors;
+				errors = atomic_read(&c->io_errors);
+				do {
+					old_errors = errors;
+					n = ((uint64_t) errors * 127) / 128;
+					errors = atomic_cmpxchg(&c->io_errors,
+								old_errors,
+								n);
+				} while (old_errors != errors);
+
+				pr_debug("Errors scaled from %d to %d\n",
+					 n, errors);
+			}
+		}
+	}
+
+	if (error) {
+		char buf[BDEVNAME_SIZE];
+		errors = atomic_add_return(1 << IO_ERROR_SHIFT, &c->io_errors);
+		pr_debug("Errors: %d, Count: %d, Refresh: %d",
+			 errors, count, refresh);
+		errors >>= IO_ERROR_SHIFT;
+
+		if (errors < c->set->error_limit)
+			printk(KERN_ERR "bcache: IO error on %s %s, recovering\n",
+			       bdevname(c->bdev, buf), m);
+		else
+			cache_set_error(c->set, "too many IO errors", m);
+	}
+}
+
+static void count_bio_errors(struct cache_set *c, struct bio *bio,
+			     int error, const char *m)
+{
+	struct bbio *b = container_of(bio, struct bbio, bio);
+	struct cache *ca = PTR_CACHE(c, &b->key, 0);
+
+	BUG_ON(bio->bi_destructor &&
+	       (bio->bi_destructor != bbio_destructor) &&
+	       (bio->bi_destructor != (void *) c->bio_split));
+	BUG_ON(KEY_PTRS(&b->key) != 1);
+
+	count_io_errors(ca, error, m);
+}
+
 /* Btree/bkey debug printing */
 
 struct keyprint_hack {
@@ -1560,18 +1689,6 @@ static void btree_op_init_stack(struct btree_op *op)
 	memset(op, 0, sizeof(struct btree_op));
 	btree_op_init(op);
 	closure_init_stack(&op->cl);
-}
-
-static struct bio *bio_split_get(struct bio *bio, int len, struct cache_set *c)
-{
-	struct bio *ret = bio_split_front(bio, len, GFP_NOIO, c->bio_split);
-
-	if (ret && ret != bio) {
-		closure_get(ret->bi_private);
-		ret->bi_rw &= ~REQ_UNPLUG;
-	}
-
-	return ret;
 }
 
 /* Bucket heap / gen */
@@ -2008,10 +2125,10 @@ static const char *ptr_status(struct cache_set *c, const struct bkey *k)
 static bool __ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
 {
 	if (level && (!KEY_PTRS(k) || !KEY_SIZE(k) || KEY_DIRTY(k)))
-		goto bad;
+		return true;
 
 	if (!level && KEY_SIZE(k) > k->key)
-		goto bad;
+		return true;
 
 	if (!KEY_SIZE(k))
 		return true;
@@ -2023,23 +2140,27 @@ static bool __ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
 
 		if (KEY_SIZE(k) + r > c->sb.bucket_size ||
 		    PTR_DEV(k, i) > MAX_CACHES_PER_SET)
-			goto bad;
+			return true;
 
 		if (ca &&
 		    (bucket <  ca->sb.first_bucket ||
 		     bucket >= ca->sb.nbuckets))
-			goto bad;
+			return true;
 	}
 
 	return false;
-bad:
-	cache_bug(c, "spotted bad key %s: %s", pkey(k), ptr_status(c, k));
-	return true;
 }
 
 static bool ptr_invalid(struct btree *b, const struct bkey *k)
 {
-	return __ptr_invalid(b->c, b->level, k);
+	if (!KEY_SIZE(k))
+		return true;
+
+	if (!__ptr_invalid(b->c, b->level, k))
+		return false;
+
+	btree_bug(b, "spotted bad key %s: %s", pkey(k), ptr_status(b->c, k));
+	return true;
 }
 
 static bool ptr_bad(struct btree *b, const struct bkey *k)
@@ -2058,10 +2179,10 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 		g = PTR_BUCKET(b->c, k, i);
 		stale = ptr_stale(b->c, k, i);
 
-		cache_bug_on(stale > 96, b, "key too stale: %i, need_gc %u",
+		btree_bug_on(stale > 96, b, "key too stale: %i, need_gc %u",
 			     stale, b->c->need_gc);
 
-		cache_bug_on(stale && KEY_DIRTY(k) && KEY_SIZE(k),
+		btree_bug_on(stale && KEY_DIRTY(k) && KEY_SIZE(k),
 			     b, "stale dirty pointer");
 
 		if (stale)
@@ -2089,7 +2210,7 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 
 	return false;
 bug:
-	cache_bug(b, "inconsistent %s pointer %s: bucket %li pin %i "
+	btree_bug(b, "inconsistent %s pointer %s: bucket %li pin %i "
 		  "prio %i gen %i last_gc %i mark %i gc_gen %i", err, pkey(k),
 		  PTR_BUCKET_NR(b->c, k, i), atomic_read(&g->pin),
 		  g->prio, g->gen, g->last_gc, g->mark, g->gc_gen);
@@ -2327,9 +2448,9 @@ static void fill_bucket_work(struct work_struct *w)
 
 	if (0) {
 err:		atomic_set(&b->nread, -1);
-		cache_bug(b, "%s at bucket %lu, block %i, %i keys",
-			  err, PTR_BUCKET_NR(b->c, &b->key, 0),
-			  index(i, b), i->keys);
+		cache_set_error(b->c, "%s at bucket %lu, block %i, %i keys",
+				err, PTR_BUCKET_NR(b->c, &b->key, 0),
+				index(i, b), i->keys);
 	}
 
 	mutex_unlock(&b->c->fill_lock);
@@ -3051,6 +3172,12 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 		return NULL;
 	}
 
+	/* For multiple cache devices, copy only the pointer we're actually
+	 * reading from
+	 */
+	bkey_copy(op->keys.top, k);
+	SET_KEY_PTRS(op->keys.top, 1);
+
 	bdev = PTR_CACHE(b->c, k, 0)->bdev;
 	sector += KEY_SIZE(k) - k->key + PTR_OFFSET(k, 0);
 	sectors = min(sectors, __bio_max_sectors(bio, bdev, sector));
@@ -3061,17 +3188,6 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 		return ERR_PTR(-ENOMEM);
 	}
 
-	ret->bi_sector	= sector;
-	ret->bi_bdev	= bdev;
-	ret->bi_end_io	= cache_read_endio;
-
-	/* For multiple cache devices, copy only the pointer we're actually
-	 * reading from
-	 */
-	bkey_copy(op->keys.top, k);
-	SET_KEY_PTRS(op->keys.top, 1);
-	keylist_push(&op->keys);
-
 	g->prio = initial_prio;
 			/* * (cache_hit_seek + cache_hit_priority
 			 * bio_sectors(bio) / c->sb.bucket_size)
@@ -3080,6 +3196,12 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	pr_debug("cache hit of %i sectors from %llu, need %i sectors",
 		 bio_sectors(ret), (uint64_t) ret->bi_sector,
 		 ret == bio ? 0 : bio_sectors(bio));
+
+	ret->bi_sector	= sector;
+	ret->bi_end_io	= cache_read_endio;
+
+	__submit_bbio(ret, b->c, op->keys.top);
+	keylist_push(&op->keys);
 
 	return ret;
 }
@@ -3126,8 +3248,6 @@ static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 			if (IS_ERR(n))
 				return -ENOMEM;
 
-			generic_make_request(n);
-
 			if (n == bio) {
 				s->cache_hit = true;
 				return 0;
@@ -3157,7 +3277,7 @@ static int btree_search_recurse(struct btree *b, struct search *s,
 			return ret;
 	}
 
-	cache_bug_on(ret == -1, b, "no key to recurse on at level %i/%i",
+	btree_bug_on(ret == -1, b, "no key to recurse on at level %i/%i",
 		     b->level, b->c->root->level);
 	return 0;
 }
@@ -3390,7 +3510,7 @@ static int btree_gc_mark(struct btree *b, size_t *keys, struct gc_stat *gc)
 	struct bkey *k;
 
 	for_each_sorted_set(b, i)
-		cache_bug_on(i->keys && bkey_cmp(&b->key, last_key(i)) < 0,
+		btree_bug_on(i->keys && bkey_cmp(&b->key, last_key(i)) < 0,
 			     b, "found short btree key in gc");
 
 	gc->nodes++;
@@ -3608,7 +3728,7 @@ static size_t btree_gc_finish(struct cache_set *c)
 
 		for_each_bucket(b, ca) {
 			cache_bug_on(c->journal.cur &&
-				     gen_after(b->last_gc, b->gc_gen), ca,
+				     gen_after(b->last_gc, b->gc_gen), c,
 				     "found old gen in gc");
 
 			b->last_gc	= b->gc_gen;
@@ -4027,7 +4147,7 @@ static int btree_insert_recurse(struct btree *b, struct btree_op *op,
 		struct bkey *k = next_recurse_key(b, &START_KEY(insert));
 
 		if (!k) {
-			cache_bug(b, "no key to recurse on at level %i/%i",
+			btree_bug(b, "no key to recurse on at level %i/%i",
 				  b->level, b->c->root->level);
 
 			op->keys.top = op->keys.bottom;
@@ -4720,7 +4840,7 @@ static void set_new_root(struct btree *b)
 static void uuid_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
-	cache_io_err_on(error, c, "accessing uuids");
+	count_io_errors(c, error, "accessing uuids");
 
 	bio_put(bio);
 	closure_put(c->set->uuid_writer, delayed);
@@ -5036,8 +5156,9 @@ static void write_dirty(struct closure *cl)
 static void read_dirty_endio(struct bio *bio, int error)
 {
 	struct dirty *w = bio->bi_private;
-	cache_io_err_on(error, PTR_CACHE(w->io->d->c, &w->key, 0),
-			"reading from cache");
+
+	count_io_errors(PTR_CACHE(w->io->d->c, &w->key, 0),
+			error, "reading dirty data from cache");
 
 	dirty_endio(bio, error);
 }
@@ -5210,13 +5331,15 @@ found:
 static void bio_insert_endio(struct bio *bio, int error)
 {
 	struct closure *cl = bio->bi_private;
+	struct btree_op *op = container_of(cl, struct btree_op, cl);
+	struct search *s = container_of(op, struct search, op);
+
+	count_bio_errors(op->d->c, bio, error, "writing data to cache");
 
 	if (error) {
-		struct btree_op *op = container_of(cl, struct btree_op, cl);
-
-		cache_set_error(op->d->c, "writing data to cache");
+		/* TODO: We could try to recover from this. */
 		if (op->insert_type == INSERT_WRITEBACK)
-			container_of(op, struct search, op)->error = error;
+			s->error = error;
 
 		if (op->insert_type == INSERT_WRITE) {
 			/* XXX: technically racy, if bio_insert() split and
@@ -5283,18 +5406,15 @@ static void bio_insert(struct closure *cl)
 		pr_debug("%s", pkey(k));
 		keylist_push(&op->keys);
 
-		cl->fn = btree_journal;
-
-		n->bi_rw	|= REQ_WRITE;
-		n->bi_sector	 = PTR_OFFSET(k, 0);
-		n->bi_bdev	 = PTR_CACHE(op->d->c, k, 0)->bdev;
-
 		if (n == bio) {
 			maybe_refill_dirty(op);
 			s->bio_done = true;
 		}
 
-		generic_make_request(n);
+		cl->fn = btree_journal;
+		n->bi_rw |= REQ_WRITE;
+
+		submit_bbio(n, op->d->c, k);
 	} while (n != bio);
 
 	return;
@@ -5306,19 +5426,23 @@ err:
 		 * closure, then invalidate in btree and do normal
 		 * write
 		 */
-		s->bio_done = true;
-		/* will call bio_insert_endio()... */
-		bio_endio(bio, -ENOMEM);
+		s->bio_done	= true;
+		s->error	= -ENOMEM;
+		cl->fn		= NULL;
 		break;
 	case INSERT_WRITE:
-		s->skip = true;
+		s->skip		= true;
 		bio_invalidate(s);
-		bio_endio(bio, 0);
 		break;
 	case INSERT_READ:
-		s->bio_done = true;
-		bio_endio(bio, 0);
+		s->bio_done	= true;
 	}
+
+	/* IO never happened, so bbio key isn't set up, so we can't call
+	 * bio_endio()
+	 */
+	bio_put(bio);
+	closure_put(cl, delayed);
 
 	pr_debug("error for %s, %i/%i sectors done, bi_sector %llu",
 		 insert_type(op), sectors - bio_sectors(bio), sectors,
@@ -5410,12 +5534,13 @@ static void request_endio(struct bio *bio, int error)
 
 static void cache_read_endio(struct bio *bio, int error)
 {
-	if (error) {
-		struct closure *cl = bio->bi_private;
-		struct search *s = container_of(cl, struct search, cl);
+	struct closure *cl = bio->bi_private;
+	struct search *s = container_of(cl, struct search, cl);
+
+	count_bio_errors(s->op.d->c, bio, error, "reading from cache");
+
+	if (error)
 		s->error = error;
-		cache_set_error(s->op.d->c, "reading from cache");
-	}
 
 	request_endio(bio, 0);
 }
@@ -5558,7 +5683,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 		sectors = min(sectors, pages);
 
 	pages = DIV_ROUND_UP(sectors, PAGE_SECTORS);
-	s->cache_bio = bio_kmalloc(GFP_NOIO, last_bio->bi_max_vecs + pages);
+	s->cache_bio = bbio_kmalloc(GFP_NOIO, last_bio->bi_max_vecs + pages);
 	if (!s->cache_bio)
 		return;
 
@@ -5732,7 +5857,7 @@ skip:		s->cache_bio = s->orig_bio;
 	}
 
 	if (s->op.insert_type == INSERT_WRITE) {
-		s->cache_bio = bio_kmalloc(GFP_NOIO, bio->bi_max_vecs);
+		s->cache_bio = bbio_kmalloc(GFP_NOIO, bio->bi_max_vecs);
 		if (!s->cache_bio) {
 			s->skip = true;
 			goto skip;
@@ -5840,6 +5965,7 @@ read_attribute(bset_tree_stats);
 read_attribute(state);
 read_attribute(writeback_keys_done);
 read_attribute(writeback_keys_failed);
+read_attribute(io_errors);
 
 rw_attribute(sequential_cutoff);
 rw_attribute(sequential_cutoff_average);
@@ -5853,6 +5979,8 @@ rw_attribute(writeback_percent);
 rw_attribute(running);
 rw_attribute(label);
 rw_attribute(readahead);
+rw_attribute(io_error_limit);
+rw_attribute(io_error_halflife);
 
 static int btree_check(struct btree *b, struct btree_op *op)
 {
@@ -6319,7 +6447,7 @@ static void write_super_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
 
-	cache_io_err_on(error, c, "writing superblock");
+	count_io_errors(c, error, "writing superblock");
 	closure_put(c->set->sb_writer, delayed);
 }
 
@@ -6357,7 +6485,8 @@ static void write_super(struct cache_set *c, struct closure *cl)
 static void prio_endio(struct bio *bio, int error)
 {
 	struct cache *c = bio->bi_private;
-	cache_io_err_on(error, c, "writing priorities");
+	BUG_ON(c->prio_bio->bi_flags & (1 << BIO_HAS_POOL));
+	count_io_errors(c, error, "writing priorities");
 
 	bio_put(bio);
 	closure_put(&c->prio, system_wq);
@@ -7186,6 +7315,10 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 		    atomic_long_read(&c->writeback_keys_done));
 	sysfs_print(writeback_keys_failed,
 		    atomic_long_read(&c->writeback_keys_failed));
+
+	sysfs_print(io_error_limit,		c->error_limit);
+	/* See count_io_errors for why 88 */
+	sysfs_print(io_error_halflife,		c->error_decay * 88);
 	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
 
 	sysfs_hprint(bypassed,		sum_bdev(sectors_bypassed) << 9);
@@ -7261,14 +7394,26 @@ static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
 		atomic_long_set(&c->writeback_keys_failed,	0);
 		atomic_long_set(&c->btree_write_count,		0);
 		atomic_long_set(&c->keys_write_count,		0);
+
 		memset(&c->gc_stats, 0, sizeof(struct gc_stat));
 	}
 
 	if (attr == &sysfs_trigger_gc)
 		queue_work(delayed, &c->gc_work);
 
+	sysfs_strtoul(io_error_limit, c->error_limit);
+	if (attr == &sysfs_io_error_halflife) {
+		long halflife = 0;
+		ssize_t ret = strtoul_safe(io_error_halflife, halflife);
+		/* See count_io_errors for why 88 */
+		c->error_decay = halflife / 88;
+		return ret ?: size;
+	}
+
 	return size;
 }
+
+/* Error handling stuff */
 
 static bool cache_set_error(struct cache_set *c, const char *m, ...)
 {
@@ -7291,16 +7436,6 @@ static bool cache_set_error(struct cache_set *c, const char *m, ...)
 
 	queue_work(delayed, &c->unregister);
 	return true;
-}
-
-static void cache_io_error(struct cache *c, const char *m)
-{
-	char buf[BDEVNAME_SIZE];
-
-	printk(KERN_ERR "bcache: IO error on %s %s\n",
-	       bdevname(c->bdev, buf), m);
-
-	cache_set_error(c->set, "IO error");
 }
 
 static void free_cache_set(struct cache_set *c)
@@ -7481,6 +7616,8 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	c->shrink.seeks = 3;
 	register_shrinker(&c->shrink);
 
+	c->error_limit = 8 << IO_ERROR_SHIFT;
+
 	return c;
 err:
 	free_cache_set(c);
@@ -7656,6 +7793,8 @@ static const char *register_cache_set(struct cache *c)
 
 		&sysfs_writeback_keys_done,
 		&sysfs_writeback_keys_failed,
+		&sysfs_io_error_limit,
+		&sysfs_io_error_halflife,
 		&sysfs_active_journal_entries,
 		&sysfs_clear_stats,
 
@@ -7757,6 +7896,9 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 		     (atomic_long_read(&c->meta_sectors_written) +
 		      atomic_long_read(&c->btree_sectors_written)) << 9);
 
+	sysfs_print(io_errors,
+		    atomic_read(&c->io_errors) >> IO_ERROR_SHIFT);
+
 	if (attr == &sysfs_priority_stats) {
 		int cmp(const void *l, const void *r)
 		{	return *((uint16_t *) l) - *((uint16_t *) r); }
@@ -7818,6 +7960,8 @@ static ssize_t store_cache(struct kobject *kobj, struct attribute *attr,
 		atomic_long_set(&c->sectors_written, 0);
 		atomic_long_set(&c->btree_sectors_written, 0);
 		atomic_long_set(&c->meta_sectors_written, 0);
+		atomic_set(&c->io_count, 0);
+		atomic_set(&c->io_errors, 0);
 	}
 
 	return size;
@@ -7882,6 +8026,7 @@ static int register_cache_kobj(struct cache *c)
 		&sysfs_written,
 		&sysfs_btree_written,
 		&sysfs_metadata_written,
+		&sysfs_io_errors,
 		&sysfs_clear_stats,
 		NULL
 	};

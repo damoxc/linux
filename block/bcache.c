@@ -7907,7 +7907,7 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 		uint64_t sum = 0;
 		uint16_t q[7], *p;
 
-		p = kmalloc(c->sb.nbuckets * sizeof(uint16_t), GFP_KERNEL);
+		p = vmalloc(c->sb.nbuckets * sizeof(uint16_t));
 		if (!p)
 			return -ENOMEM;
 
@@ -7935,7 +7935,7 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 		for (i = 0; i < 7; i++)
 			q[i] = p[zero + (n - zero - btree) * (i + 1) / 8];
 
-		kfree(p);
+		vfree(p);
 		return snprintf(buf, PAGE_SIZE,
 				"Zero:	%zu%%\n"
 				"Btree:	%zu%%\n"

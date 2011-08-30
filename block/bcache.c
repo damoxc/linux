@@ -341,6 +341,7 @@ struct cache_set {
 
 	atomic_t		closing;
 	struct kobject		kobj;
+	struct kobject		internal;
 	struct work_struct	unregister;
 	struct list_head	devices;
 
@@ -7370,10 +7371,9 @@ static ssize_t show_cache_set(struct kobject *kobj, struct attribute *attr,
 	return ret;
 }
 
-static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
-			       const char *buffer, size_t size)
+static ssize_t __store_cache_set(struct cache_set *c, struct attribute *attr,
+				 const char *buffer, size_t size)
 {
-	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
 	struct closure cl;
 	closure_init_stack(&cl);
 
@@ -7419,6 +7419,34 @@ static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
 	return size;
 }
 
+static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
+			       const char *buffer, size_t size)
+{
+	struct cache_set *c = container_of(kobj, struct cache_set, kobj);
+	return __store_cache_set(c, attr, buffer, size);
+}
+
+static ssize_t show_cache_set_internal(struct kobject *kobj,
+				       struct attribute *attr,
+				       char *buf)
+{
+	struct cache_set *c = container_of(kobj, struct cache_set, internal);
+	ssize_t ret;
+
+	mutex_lock(&register_lock);
+	ret = __show_cache_set(c, attr, buf);
+	mutex_unlock(&register_lock);
+	return ret;
+}
+
+static ssize_t store_cache_set_internal(struct kobject *kobj,
+					struct attribute *attr,
+					const char *buffer,
+					size_t size)
+{
+	struct cache_set *c = container_of(kobj, struct cache_set, internal);
+	return __store_cache_set(c, attr, buffer, size);
+}
 /* Error handling stuff */
 
 static bool cache_set_error(struct cache_set *c, const char *m, ...)
@@ -7510,6 +7538,10 @@ static void unregister_cache_set(struct kobject *k)
 		kobject_put(&ca->kobj);
 
 	free_cache_set(c);
+}
+
+static void unregister_cache_set_internal(struct kobject *k)
+{
 }
 
 static void unregister_cache_set_work(struct work_struct *w)
@@ -7773,7 +7805,7 @@ static bool can_attach_cache(struct cache *c, struct cache_set *s)
 		c->sb.nr_in_set == s->sb.nr_in_set;
 }
 
-static const char *register_cache_set(struct cache *c)
+static const char *register_cache_set(struct cache *ca)
 {
 	static struct attribute *files[] = {
 		&sysfs_unregister,
@@ -7782,26 +7814,14 @@ static const char *register_cache_set(struct cache *c)
 		&sysfs_block_size,
 		&sysfs_tree_depth,
 		&sysfs_root_usage_percent,
-		&sysfs_btree_avg_keys_written,
 		&sysfs_btree_cache_size,
-		&sysfs_btree_cache_max_chain,
 		&sysfs_cache_available_percent,
 
-		&sysfs_trigger_gc,
-		&sysfs_average_seconds_between_gc,
-		&sysfs_gc_ms_max,
-		&sysfs_seconds_since_gc,
-		&sysfs_btree_nodes,
-		&sysfs_btree_used_percent,
 		&sysfs_average_key_size,
 		&sysfs_dirty_data,
-		&sysfs_bset_tree_stats,
 
-		&sysfs_writeback_keys_done,
-		&sysfs_writeback_keys_failed,
 		&sysfs_io_error_limit,
 		&sysfs_io_error_halflife,
-		&sysfs_active_journal_entries,
 		&sysfs_clear_stats,
 
 		&sysfs_bypassed,
@@ -7822,64 +7842,95 @@ static const char *register_cache_set(struct cache *c)
 		.default_attrs = files
 	};
 
+	static struct attribute *internal_files[] = {
+		&sysfs_active_journal_entries,
+		&sysfs_average_seconds_between_gc,
+		&sysfs_gc_ms_max,
+		&sysfs_seconds_since_gc,
+		&sysfs_trigger_gc,
+
+		&sysfs_btree_avg_keys_written,
+		&sysfs_btree_nodes,
+		&sysfs_btree_used_percent,
+		&sysfs_btree_cache_max_chain,
+
+		&sysfs_bset_tree_stats,
+		&sysfs_writeback_keys_done,
+		&sysfs_writeback_keys_failed,
+		NULL
+	};
+	static const struct sysfs_ops internal_ops = {
+		.show = show_cache_set_internal,
+		.store = store_cache_set_internal
+	};
+	static struct kobj_type internal_obj = {
+		.release = unregister_cache_set_internal,
+		.sysfs_ops = &internal_ops,
+		.default_attrs = internal_files
+	};
+
 	char buf[12];
 	const char *err;
-	struct cache_set *s;
+	struct cache_set *cs;
 
-	list_for_each_entry(s, &cache_sets, list)
-		if (!memcmp(s->sb.set_uuid, c->sb.set_uuid, 16)) {
+	list_for_each_entry(cs, &cache_sets, list)
+		if (!memcmp(cs->sb.set_uuid, ca->sb.set_uuid, 16)) {
 			err = "duplicate cache set member";
-			if (s->cache[c->sb.nr_this_dev])
+			if (cs->cache[ca->sb.nr_this_dev])
 				goto err;
 
 			err = "cache sb does not match set";
-			if (!can_attach_cache(c, s))
+			if (!can_attach_cache(ca, cs))
 				goto err;
 
-			if (!CACHE_SYNC(&c->sb))
-				SET_CACHE_SYNC(&s->sb, false);
+			if (!CACHE_SYNC(&ca->sb))
+				SET_CACHE_SYNC(&cs->sb, false);
 
 			goto found;
 		}
 
 	err = "cannot allocate memory";
-	s = alloc_cache_set(&c->sb);
-	if (!s)
+	cs = alloc_cache_set(&ca->sb);
+	if (!cs)
 		goto err;
 
 	err = "error creating kobject";
-	if (kobject_init_and_add(&s->kobj, &set_obj, bcache_kobj,
-				 "%pU", s->sb.set_uuid))
+	if (kobject_init_and_add(&cs->kobj, &set_obj, bcache_kobj,
+				 "%pU", cs->sb.set_uuid))
 		goto err;
 
-	list_add(&s->list, &cache_sets);
+	if (kobject_init_and_add(&cs->internal, &internal_obj,
+				 &cs->kobj, "internal"))
+		goto err;
+
+	list_add(&cs->list, &cache_sets);
 found:
-	sprintf(buf, "cache%i", c->sb.nr_this_dev);
-	if (sysfs_create_link(&c->kobj, &s->kobj, "set") ||
-	    sysfs_create_link(&s->kobj, &c->kobj, buf))
+	sprintf(buf, "cache%i", ca->sb.nr_this_dev);
+	if (sysfs_create_link(&ca->kobj, &cs->kobj, "set") ||
+	    sysfs_create_link(&cs->kobj, &ca->kobj, buf))
 		goto err;
 
-	if (c->sb.seq > s->sb.seq) {
-		s->sb.version		= c->sb.version;
-		memcpy(s->sb.set_uuid, c->sb.set_uuid, 16);
-		s->sb.flags		= c->sb.flags;
-		s->sb.seq		= c->sb.seq;
-		pr_debug("set version = %llu", s->sb.version);
+	if (ca->sb.seq > cs->sb.seq) {
+		cs->sb.version		= ca->sb.version;
+		memcpy(cs->sb.set_uuid, ca->sb.set_uuid, 16);
+		cs->sb.flags		= ca->sb.flags;
+		cs->sb.seq		= ca->sb.seq;
+		pr_debug("set version = %llu", cs->sb.version);
 	}
 
-	c->set = s;
-	c->set->cache[c->sb.nr_this_dev] = c;
-	s->cache_by_alloc[s->caches_loaded++] = c;
+	ca->set = cs;
+	ca->set->cache[ca->sb.nr_this_dev] = ca;
+	cs->cache_by_alloc[cs->caches_loaded++] = ca;
 
-	if (s->caches_loaded == s->sb.nr_in_set)
-		run_cache_set(s);
+	if (cs->caches_loaded == cs->sb.nr_in_set)
+		run_cache_set(cs);
 
 	return NULL;
 err:
-	if (s && s->kobj.state_initialized)
-		kobject_put(&s->kobj);
-	else if (s)
-		free_cache_set(s);
+	if (cs && cs->kobj.state_initialized)
+		kobject_put(&cs->kobj);
+	else if (cs)
+		free_cache_set(cs);
 
 	return err;
 }

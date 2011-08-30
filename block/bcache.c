@@ -3775,13 +3775,14 @@ static void btree_gc(struct work_struct *w)
 		free_some_buckets(ca);
 	spin_unlock(&c->bucket_lock);
 
-	if (!mutex_trylock(&c->gc_lock))
-		return;
-
 	/* So pop_bucket() doesn't spin while we're blocking
 	 * invalidate_buckets()
 	 */
 	atomic_inc(&c->prio_blocked);
+	smp_mb__after_atomic_inc();
+
+	if (!mutex_trylock(&c->gc_lock))
+		goto out;
 
 	if (!bkey_cmp(&c->gc_done, &MAX_KEY)) {
 		c->gc_done = ZERO_KEY;
@@ -3800,7 +3801,7 @@ static void btree_gc(struct work_struct *w)
 		blktrace_msg_all(c, "Stopped gc");
 		printk(KERN_WARNING "bcache: gc failed!\n");
 		queue_work(delayed, &c->gc_work);
-		goto out;
+		goto out_unlock;
 	}
 
 	/* Possibly wait for new UUIDs or whatever to hit disk */
@@ -3821,9 +3822,9 @@ static void btree_gc(struct work_struct *w)
 	stats.in_use	= (c->nbuckets - available) * 100 / c->nbuckets;
 	memcpy(&c->gc_stats, &stats, sizeof(struct gc_stat));
 	blktrace_msg_all(c, "Finished gc");
-out:
+out_unlock:
 	mutex_unlock(&c->gc_lock);
-
+out:
 	atomic_dec(&c->prio_blocked);
 	closure_run_wait(&c->bucket_wait, delayed);
 }

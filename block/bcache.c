@@ -546,6 +546,7 @@ struct cached_dev {
 	unsigned		sequential_merge:1;
 
 	unsigned		writeback:1;
+	unsigned		writeback_metadata:1;
 	unsigned		writeback_running:1;
 	unsigned short		writeback_percent;
 	unsigned		writeback_delay;
@@ -5856,7 +5857,9 @@ skip:		s->cache_bio = s->orig_bio;
 		return;
 	}
 
-	if (s->op.d->writeback) {
+	if (s->op.d->writeback &&
+	    (s->op.d->writeback_metadata ||
+	     !(bio->bi_rw & REQ_META))) {
 		int i = s->op.d->c->gc_stats.in_use;
 		if (i < CUTOFF_WRITEBACK ||
 		    (i < CUTOFF_WRITEBACK_SYNC && bio->bi_rw & REQ_SYNC))
@@ -5978,11 +5981,12 @@ rw_attribute(sequential_cutoff);
 rw_attribute(sequential_cutoff_average);
 rw_attribute(sequential_merge);
 rw_attribute(writeback);
+rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
+rw_attribute(writeback_percent);
+rw_attribute(writeback_delay);
 rw_attribute(synchronous);
 rw_attribute(discard);
-rw_attribute(writeback_delay);
-rw_attribute(writeback_percent);
 rw_attribute(running);
 rw_attribute(label);
 rw_attribute(readahead);
@@ -6835,6 +6839,7 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 #define d_hprint(var)		sysfs_hprint(var, d->var)
 
 	d_printf(writeback,		"%i");
+	d_printf(writeback_metadata,	"%i");
 	d_printf(writeback_running,	"%i");
 	d_print(writeback_delay);
 	d_print(writeback_percent);
@@ -6877,10 +6882,12 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 #define d_strtoul(var)		sysfs_strtoul(var, d->var)
 #define d_strtoi_h(var)		sysfs_hatoi(var, d->var)
 
+	d_strtoul(writeback_metadata);
 	d_strtoul(writeback_running);
 	d_strtoul(writeback_delay);
-	d_strtoul(sequential_merge);
+	sysfs_strtoul_clamp(writeback_percent, d->writeback_percent, 0, 40);
 
+	d_strtoul(sequential_merge);
 	d_strtoi_h(sequential_cutoff);
 	d_strtoi_h(sequential_cutoff_average);
 	d_strtoi_h(readahead);
@@ -6896,8 +6903,6 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 	if (attr == &sysfs_running &&
 	    strtoul_or_return(buffer))
 		run_dev(d);
-
-	sysfs_strtoul_clamp(writeback_percent, d->writeback_percent, 0, 40);
 
 	if (attr == &sysfs_writeback) {
 		v = strtoul_or_return(buffer);
@@ -7034,6 +7039,7 @@ static int register_dev_kobj(struct cached_dev *d)
 		&sysfs_unregister,
 		*/
 		&sysfs_writeback,
+		&sysfs_writeback_metadata,
 		&sysfs_writeback_running,
 		&sysfs_writeback_delay,
 		&sysfs_writeback_percent,

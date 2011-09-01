@@ -340,6 +340,7 @@ struct cache_set {
 	struct mutex		sb_write;
 	struct closure		*sb_writer;
 
+	mempool_t		*search;
 	struct bio_set		*bio_split;
 	struct shrinker		shrink;
 
@@ -519,7 +520,6 @@ struct cached_dev {
 
 	struct rw_semaphore	writeback_lock;
 	struct work_struct	refill;
-	mempool_t		*search;
 
 	atomic_long_t		sectors_bypassed;
 	atomic_long_t		cache_hits;
@@ -4958,7 +4958,7 @@ static void bio_complete(struct closure *cl)
 	__bio_complete(s);
 
 	closure_del(&s->cl);
-	mempool_free(s, d->search);
+	mempool_free(s, d->c->search);
 	cached_dev_put(d);
 }
 
@@ -5093,7 +5093,7 @@ skip:
 
 static struct search *do_bio_hook(struct bio *bio, struct cached_dev *d)
 {
-	struct search *s = mempool_alloc(d->search, GFP_NOIO);
+	struct search *s = mempool_alloc(d->c->search, GFP_NOIO);
 	search_init(s);
 	closure_init(&s->cl, NULL);
 	closure_init(&s->insert, &s->cl);
@@ -6156,7 +6156,6 @@ static ssize_t store_dev(struct kobject *kobj, struct attribute *attr,
 static void free_dev(struct cached_dev *d)
 {
 	if (d) {
-		mempool_destroy(d->search);
 		list_del(&d->list);
 		kfree(d);
 	}
@@ -6186,12 +6185,6 @@ static struct cached_dev *alloc_backing_dev(void)
 	struct cached_dev *d = kzalloc(sizeof(struct cached_dev), GFP_KERNEL);
 	if (!d)
 		return NULL;
-
-	d->search = mempool_create_slab_pool(32, search_cache);
-	if (!d->search) {
-		kfree(d);
-		return NULL;
-	}
 
 	INIT_WORK(&d->refill, read_dirty_work);
 	spin_lock_init(&d->lock);
@@ -6584,6 +6577,7 @@ static void free_cache_set(struct cache_set *c)
 
 	kfree(c->fill_iter);
 	bioset_free(c->bio_split);
+	mempool_destroy(c->search);
 	kfree(c);
 }
 
@@ -6643,6 +6637,12 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 		    GFP_KERNEL);
 	if (!c)
 		return NULL;
+
+	c->search = mempool_create_slab_pool(32, search_cache);
+	if (!c->search) {
+		kfree(c);
+		return NULL;
+	}
 
 	memcpy(c->sb.set_uuid, sb->set_uuid, 16);
 	c->sb.block_size	= sb->block_size;

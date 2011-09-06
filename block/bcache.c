@@ -3140,6 +3140,12 @@ static int btree_gc_recurse(struct btree *b, struct search *s,
 		lock_set_subclass(&r->lock.dep_map, 0, _THIS_IP_);
 		p = r;
 		pkeys = keys;
+
+		/* When we've got incremental GC working, we'll want to do
+		 * if (should_resched())
+		 *	return -EAGAIN;
+		 */
+		cond_resched();
 	}
 
 	if (p)

@@ -5719,17 +5719,28 @@ skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
 
 /* Sysfs */
 
-#define write_attribute(n)	\
-	static struct attribute sysfs_##n = { .name = #n, .mode = S_IWUSR }
-#define read_attribute(n)	\
-	static struct attribute sysfs_##n = { .name = #n, .mode = S_IRUSR }
-#define rw_attribute(n)	\
-	static struct attribute sysfs_##n =				\
-		{ .name = #n, .mode = S_IWUSR|S_IRUSR }
+#define kobj_attribute_write(n, fn)					\
+	static struct kobj_attribute ksysfs_##n = __ATTR(n, S_IWUSR, NULL, fn)
 
-#define sysfs_print(file, fmt, ...)					\
+#define kobj_attribute_rw(n, show, store)				\
+	static struct kobj_attribute ksysfs_##n =			\
+		__ATTR(n, S_IWUSR|S_IRUSR, show, store)
+
+#define __attribute(_name, _mode)					\
+	static struct attribute sysfs_##_name =				\
+		{ .name = #_name, .mode = _mode }
+
+#define write_attribute(n)	__attribute(n, S_IWUSR)
+#define read_attribute(n)	__attribute(n, S_IRUSR)
+#define rw_attribute(n)		__attribute(n, S_IWUSR|S_IRUSR)
+
+#define sysfs_printf(file, fmt, ...)					\
 	if (attr == &sysfs_ ## file)					\
 		return snprintf(buf, PAGE_SIZE, fmt "\n", __VA_ARGS__)
+
+#define sysfs_print(file, var)						\
+	if (attr == &sysfs_ ## file)					\
+		return snprint(buf, PAGE_SIZE, var)
 
 #define sysfs_hprint(file, val)						\
 	if (attr == &sysfs_ ## file) {					\
@@ -5738,18 +5749,26 @@ skip:		s->cache_bio = bio_alloc_bioset(GFP_NOIO, 0,
 		return ret + 1;						\
 	}
 
-#define sysfs_atoi(file, var)						\
-	if (attr == &sysfs_ ## file) {					\
-		unsigned long _v;					\
-		int _r = strict_strtoul(buffer, 10, &_v);		\
-		if (_r)							\
-			return _r;					\
-		var = _v;						\
-	}
+#define sysfs_strtoul(file, var)					\
+	if (attr == &sysfs_ ## file)					\
+		return strtoul_safe(buffer, var) ?: size;
+
+#define sysfs_strtoul_clamp(file, var, min, max)			\
+	if (attr == &sysfs_ ## file)					\
+		return strtoul_safe_clamp(buffer, var, min, max) ?: size;
+
+#define strtoul_or_return(cp)						\
+({									\
+	unsigned long _v;						\
+	int _r = strict_strtoul(buffer, 10, &_v);			\
+	if (_r)								\
+		return _r;						\
+	_v;								\
+})
 
 #define sysfs_hatoi(file, var)						\
 	if (attr == &sysfs_ ## file)					\
-		return strtoi_h(buffer, &var) ? : size;			\
+		return strtoi_h(buffer, &var) ?: size;			\
 
 write_attribute(attach);
 write_attribute(detach);
@@ -6063,29 +6082,23 @@ static ssize_t btree_fuzz(struct kobject *k, struct kobj_attribute *a,
 	}
 }
 
-static struct kobj_attribute sysfs_fuzz =
-	__ATTR(fuzz, S_IWUSR, NULL, btree_fuzz);
+kobj_attribute_write(fuzz, btree_fuzz);
+
 #endif
 
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
-static ssize_t show(struct kobject *k, struct kobj_attribute *attr,
-		    char *buf)
+static ssize_t show(struct kobject *k, struct kobj_attribute *attr, char *buf)
 {
 	return snprintf(buf, PAGE_SIZE, "%i\n", latency_warn_ms);
 }
 
 static ssize_t store(struct kobject *k, struct kobj_attribute *attr,
-		     const char *buffer, size_t size);
-
-static struct kobj_attribute sysfs_latency_warn_ms =
-	__ATTR(latency_warn_ms, S_IWUSR|S_IRUSR, show, store);
-
-static ssize_t store(struct kobject *k, struct kobj_attribute *attr,
 		     const char *buffer, size_t size)
 {
-	sysfs_atoi(latency_warn_ms, latency_warn_ms);
-	return size;
+	return strtoul_safe(buffer, latency_warn_ms) ?: size;
 }
+
+kobj_attribute_rw(latency_warn_ms, show, store);
 #endif
 
 /* Superblock/other metadata */
@@ -6651,24 +6664,31 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 		return DIV_SAFE(hits * 100, hits + misses);
 	}
 
-	sysfs_print(writeback, "%i",		d->writeback);
-	sysfs_print(writeback_running, "%i",	d->writeback_running);
-	sysfs_print(writeback_delay, "%i",	d->writeback_delay);
-	sysfs_print(writeback_percent, "%i",	d->writeback_percent);
-	sysfs_hprint(sequential_cutoff,		d->sequential_cutoff);
-	sysfs_hprint(sequential_cutoff_average,	d->sequential_cutoff_average);
-	sysfs_hprint(sequential_merge,		d->sequential_merge);
-	sysfs_hprint(bypassed, atomic_long_read(&d->sectors_bypassed) << 9);
-	sysfs_print(cache_hits, "%lu", atomic_long_read(&d->cache_hits));
-	sysfs_print(cache_misses, "%lu", atomic_long_read(&d->cache_misses));
-	sysfs_print(cache_hit_ratio,	"%u", cache_hit_ratio(d));
-	sysfs_print(cache_readaheads, "%lu",
-		    atomic_long_read(&d->cache_readaheads));
-	sysfs_print(cache_miss_collisions, "%lu",
-		    atomic_long_read(&d->cache_miss_collisions));
-	sysfs_print(running, "%i",		atomic_read(&d->running));
-	sysfs_print(state, "%s",		states[BDEV_STATE(&d->sb)]);
-	sysfs_hprint(readahead,                 d->readahead);
+#define d_printf(var, fmt)	sysfs_printf(var, fmt, d->var)
+#define d_print(var)		sysfs_print(var, d->var)
+#define d_hprint(var)		sysfs_hprint(var, d->var)
+
+	d_printf(writeback,		"%i");
+	d_printf(writeback_running,	"%i");
+	d_print(writeback_delay);
+	d_print(writeback_percent);
+
+	d_hprint(sequential_cutoff);
+	d_hprint(sequential_cutoff_average);
+	d_printf(sequential_merge,	"%i");
+
+	sysfs_hprint(bypassed,	atomic_long_read(&d->sectors_bypassed) << 9);
+	sysfs_print(cache_hits,		atomic_long_read(&d->cache_hits));
+	sysfs_print(cache_misses,	atomic_long_read(&d->cache_misses));
+	sysfs_print(cache_hit_ratio,	cache_hit_ratio(d));
+	sysfs_print(cache_readaheads,
+		     atomic_long_read(&d->cache_readaheads));
+	sysfs_print(cache_miss_collisions,
+		     atomic_long_read(&d->cache_miss_collisions));
+	sysfs_print(running,		atomic_read(&d->running));
+	sysfs_print(state,		states[BDEV_STATE(&d->sb)]);
+
+	d_hprint(readahead);
 
 	if (attr == &sysfs_label) {
 		memcpy(buf, d->sb.label, SB_LABEL_SIZE);
@@ -6688,12 +6708,16 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 	struct closure cl;
 	closure_init_stack(&cl);
 
-	sysfs_atoi(writeback_running,	d->writeback_running);
-	sysfs_atoi(writeback_delay,	d->writeback_delay);
-	sysfs_atoi(sequential_merge,	d->sequential_merge);
-	sysfs_hatoi(sequential_cutoff,	d->sequential_cutoff);
-	sysfs_hatoi(sequential_cutoff_average,	d->sequential_cutoff_average);
-	sysfs_hatoi(readahead,          d->readahead);
+#define d_strtoul(var)		sysfs_strtoul(var, d->var)
+#define d_strtoi_h(var)		sysfs_hatoi(var, d->var)
+
+	d_strtoul(writeback_running);
+	d_strtoul(writeback_delay);
+	d_strtoul(sequential_merge);
+
+	d_strtoi_h(sequential_cutoff);
+	d_strtoi_h(sequential_cutoff_average);
+	d_strtoi_h(readahead);
 
 	if (attr == &sysfs_clear_stats) {
 		atomic_long_set(&d->sectors_bypassed, 0);
@@ -6703,19 +6727,14 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 		atomic_long_set(&d->cache_miss_collisions, 0);
 	}
 
-	if (attr == &sysfs_running) {
-		sysfs_atoi(running, v);
-		if (v)
-			run_dev(d);
-	}
+	if (attr == &sysfs_running &&
+	    strtoul_or_return(buffer))
+		run_dev(d);
 
-	if (attr == &sysfs_writeback_percent) {
-		sysfs_atoi(writeback_percent, v);
-		d->writeback_percent = min(v, 40U);
-	}
+	sysfs_strtoul_clamp(writeback_percent, d->writeback_percent, 0, 40);
 
 	if (attr == &sysfs_writeback) {
-		sysfs_atoi(writeback, v);
+		v = strtoul_or_return(buffer);
 		SET_BDEV_WRITEBACK(&d->sb, v);
 
 		if (v &&
@@ -7012,28 +7031,21 @@ err:
 /* Cache set */
 
 #define sum_bdev(stat)					\
-size_t stat(struct cache_set *c)			\
-{							\
+({							\
 	struct cached_dev *d;				\
 	size_t ret = 0;					\
 	list_for_each_entry(d, &c->devices, list)	\
 		ret += atomic_long_read(&d->stat);	\
-	return ret;					\
-}
+	ret;						\
+})
 
 static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 				char *buf)
 {
-	sum_bdev(sectors_bypassed)
-	sum_bdev(cache_hits)
-	sum_bdev(cache_misses)
-	sum_bdev(cache_readaheads)
-	sum_bdev(cache_miss_collisions)
-
 	unsigned cache_hit_ratio(struct cache_set *c)
 	{
-		unsigned long hits = cache_hits(c), misses = cache_misses(c);
-		return DIV_SAFE(hits * 100, hits + misses);
+		unsigned long hits = sum_bdev(cache_hits);
+		return DIV_SAFE(hits * 100, hits + sum_bdev(cache_misses));
 	}
 
 	unsigned root_usage(struct cache_set *c)
@@ -7087,47 +7099,45 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 				 (c->gc_stats.nodes ?: 1) * btree_bytes(c));
 	}
 
-	sysfs_print(synchronous,	"%i", (int) CACHE_SYNC(&c->sb));
-	sysfs_hprint(bucket_size,	bucket_bytes(c));
-	sysfs_hprint(block_size,	block_bytes(c));
-	sysfs_print(tree_depth,		"%u", c->root->level);
-	sysfs_print(root_usage_percent,	"%u", root_usage(c));
-	sysfs_print(btree_avg_keys_written, "%li",
+	sysfs_print(synchronous,		CACHE_SYNC(&c->sb));
+	sysfs_hprint(bucket_size,		bucket_bytes(c));
+	sysfs_hprint(block_size,		block_bytes(c));
+	sysfs_print(tree_depth,			c->root->level);
+	sysfs_print(root_usage_percent,		root_usage(c));
+	sysfs_print(btree_avg_keys_written,
 		    DIV_SAFE(atomic_long_read(&c->keys_write_count),
 			     atomic_long_read(&c->btree_write_count)));
 
-	sysfs_hprint(btree_cache_size,	cache_size(c));
-	sysfs_print(btree_cache_max_chain, "%u", cache_max_chain(c));
-	sysfs_print(cache_available_percent, "%u", 100 - c->gc_stats.in_use);
+	sysfs_hprint(btree_cache_size,		cache_size(c));
+	sysfs_print(btree_cache_max_chain,	cache_max_chain(c));
+	sysfs_print(cache_available_percent,	100 - c->gc_stats.in_use);
 
-	sysfs_print(average_seconds_between_gc, "%li",
+	sysfs_print(average_seconds_between_gc,
 		    DIV_SAFE(get_seconds() - c->sb.last_mount,
 			     c->gc_stats.count));
 
-	sysfs_print(gc_ms_max,		"%u", c->gc_stats.ms_max);
-	sysfs_print(seconds_since_gc,	"%li", !c->gc_stats.last ? -1 :
+	sysfs_print(gc_ms_max,		c->gc_stats.ms_max);
+	sysfs_print(seconds_since_gc,	!c->gc_stats.last ? -1 :
 		    get_seconds() - c->gc_stats.last);
 
-	sysfs_print(btree_nodes,	"%zu", c->gc_stats.nodes);
-	sysfs_print(btree_used_percent,	"%u", btree_used(c));
+	sysfs_print(btree_used_percent,	btree_used(c));
+	sysfs_print(btree_nodes,	c->gc_stats.nodes);
+	sysfs_hprint(dirty_data,	c->gc_stats.dirty);
 	sysfs_hprint(average_key_size,	DIV_SAFE(c->gc_stats.data,
 						 c->gc_stats.nkeys));
 
-	sysfs_hprint(dirty_data,	c->gc_stats.dirty);
-
-	sysfs_print(writeback_keys_done,	"%li",
+	sysfs_print(writeback_keys_done,
 		    atomic_long_read(&c->writeback_keys_done));
-	sysfs_print(writeback_keys_failed,	"%li",
+	sysfs_print(writeback_keys_failed,
 		    atomic_long_read(&c->writeback_keys_failed));
-	sysfs_print(active_journal_entries,	"%zu",
-		    fifo_used(&c->journal.pin));
+	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
 
-	sysfs_hprint(bypassed,		sectors_bypassed(c) << 9);
-	sysfs_print(cache_hits,		"%lu",	cache_hits(c));
-	sysfs_print(cache_misses,	"%lu", cache_misses(c));
-	sysfs_print(cache_hit_ratio,	"%u", cache_hit_ratio(c));
-	sysfs_print(cache_readaheads,	"%lu", cache_readaheads(c));
-	sysfs_print(cache_miss_collisions, "%lu", cache_miss_collisions(c));
+	sysfs_hprint(bypassed,		sum_bdev(sectors_bypassed) << 9);
+	sysfs_print(cache_hits,		sum_bdev(cache_hits));
+	sysfs_print(cache_misses,	sum_bdev(cache_misses));
+	sysfs_print(cache_hit_ratio,	cache_hit_ratio(c));
+	sysfs_print(cache_readaheads,	sum_bdev(cache_readaheads));
+	sysfs_print(cache_miss_collisions, sum_bdev(cache_miss_collisions));
 
 	if (attr == &sysfs_bset_tree_stats) {
 		struct search sr;
@@ -7139,7 +7149,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 
 		btree_root(bset_stats, c, &sr, &t);
 
-		sysfs_print(bset_tree_stats,
+		sysfs_printf(bset_tree_stats,
 			    "sets:		%zu\n"
 			    "key bytes:	%zu\n"
 			    "trees:		%zu\n"
@@ -7178,8 +7188,7 @@ static ssize_t store_cache_set(struct kobject *kobj, struct attribute *attr,
 		schedule_work(&c->unregister);
 
 	if (attr == &sysfs_synchronous) {
-		bool sync;
-		sysfs_atoi(synchronous, sync);
+		bool sync = strtoul_or_return(buffer);
 
 		if (sync != CACHE_SYNC(&c->sb)) {
 			mutex_lock(&register_lock);
@@ -7680,8 +7689,8 @@ static ssize_t show_cache(struct kobject *kobj, struct attribute *attr,
 
 	sysfs_hprint(bucket_size,	bucket_bytes(c));
 	sysfs_hprint(block_size,	block_bytes(c));
-	sysfs_print(nbuckets,		"%lli", c->sb.nbuckets);
-	sysfs_print(discard,		"%i", c->discard);
+	sysfs_print(nbuckets,		c->sb.nbuckets);
+	sysfs_print(discard,		c->discard);
 	sysfs_hprint(written, atomic_long_read(&c->sectors_written) << 9);
 	sysfs_hprint(btree_written,
 		     atomic_long_read(&c->btree_sectors_written) << 9);
@@ -7744,7 +7753,7 @@ static ssize_t store_cache(struct kobject *kobj, struct attribute *attr,
 	struct cache *c = container_of(kobj, struct cache, kobj);
 
 	if (blk_queue_discard(bdev_get_queue(c->bdev)))
-		sysfs_atoi(discard, c->discard);
+		sysfs_strtoul(discard, c->discard);
 
 	if (attr == &sysfs_clear_stats) {
 		atomic_long_set(&c->sectors_written, 0);
@@ -7954,7 +7963,13 @@ err_nofree:
 
 /* Global interfaces/init */
 
-static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *a,
+static ssize_t register_bcache(struct kobject *, struct kobj_attribute *,
+			       const char *, size_t);
+
+kobj_attribute_write(register,		register_bcache);
+kobj_attribute_write(register_quiet,	register_bcache);
+
+static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 			       const char *buffer, size_t size)
 {
 	ssize_t ret = size;
@@ -8003,7 +8018,9 @@ err_close:
 		close_bdev_exclusive(bdev, FMODE_READ|FMODE_WRITE);
 err:
 		module_put(THIS_MODULE);
-		printk(KERN_DEBUG "bcache: error opening %s: %s\n", path, err);
+		if (attr != &ksysfs_register_quiet)
+			printk(KERN_DEBUG "bcache: error opening %s: %s\n",
+			       path, err);
 		ret = -EINVAL;
 	}
 
@@ -8013,18 +8030,16 @@ err:
 	return ret;
 }
 
-static struct kobj_attribute sysfs_register =
-	__ATTR(register, S_IWUSR, NULL, register_bcache);
-
 static int __init bcache_init(void)
 {
 	static const struct attribute *files[] = {
-		&sysfs_register.attr,
+		&ksysfs_register.attr,
+		&ksysfs_register_quiet.attr,
 #ifdef CONFIG_BCACHE_DEBUG
-		&sysfs_fuzz.attr,
+		&ksysfs_fuzz.attr,
 #endif
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
-		&sysfs_latency_warn_ms.attr,
+		&ksysfs_latency_warn_ms.attr,
 #endif
 		NULL};
 

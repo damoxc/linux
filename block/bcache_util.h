@@ -249,6 +249,41 @@ int strtoull_h(const char *, unsigned long long *);
 	: __builtin_types_compatible_p(typeof(*res), unsigned long long)\
 	? strtoull_h(cp, (void *) res) : -EINVAL)
 
+#define strtoul_safe(cp, var)						\
+({									\
+	unsigned long _v;						\
+	int _r = strict_strtoul(buffer, 10, &_v);			\
+	if (!_r)							\
+		var = _v;						\
+	_r;								\
+})
+
+#define strtoul_safe_clamp(cp, var, min, max)				\
+({									\
+	unsigned long _v;						\
+	int _r = strict_strtoul(buffer, 10, &_v);			\
+	if (!_r)							\
+		var = clamp_t(typeof(var), _v, min, max);		\
+	_r;								\
+})
+
+#define snprint(buf, size, var)						\
+	snprintf(buf, size,						\
+		__builtin_types_compatible_p(typeof(var), int)		\
+		     ? "%i\n" :						\
+		__builtin_types_compatible_p(typeof(var), unsigned)	\
+		     ? "%u\n" :						\
+		__builtin_types_compatible_p(typeof(var), long)		\
+		     ? "%li\n" :					\
+		__builtin_types_compatible_p(typeof(var), unsigned long)\
+		     ? "%lu\n" :					\
+		__builtin_types_compatible_p(typeof(var), int64_t)	\
+		     ? "%lli\n" :					\
+		__builtin_types_compatible_p(typeof(var), uint64_t)	\
+		     ? "%llu\n" :					\
+		__builtin_types_compatible_p(typeof(var), const char *)	\
+		     ? "%s\n" : "%i\n", var)
+
 ssize_t hprint(char *buf, int64_t v);
 bool is_zero(const char *p, size_t n);
 int parse_uuid(const char *s, char *uuid);

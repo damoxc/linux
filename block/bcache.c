@@ -536,8 +536,18 @@ struct cached_dev {
 	struct work_struct	refill;
 
 	atomic_long_t		sectors_bypassed;
-	atomic_long_t		cache_hits;
-	atomic_long_t		cache_misses;
+
+	union {
+		atomic_long_t	cache_accounting[2][2];
+
+		struct {
+			atomic_long_t	cache_hits;
+			atomic_long_t	cache_misses;
+			atomic_long_t	cache_bypass_hits;
+			atomic_long_t	cache_bypass_misses;
+		};
+	};
+
 	atomic_long_t		cache_readaheads;
 	atomic_long_t		cache_miss_collisions;
 
@@ -707,6 +717,7 @@ struct search {
 	unsigned		bio_done:1;
 	unsigned		lookup_done:1;
 	unsigned		cache_hit:1;
+	unsigned		cache_miss:1;
 	unsigned		recoverable:1;
 
 	/* IO error returned to s->bio */
@@ -3230,6 +3241,7 @@ static int btree_search(struct btree *b, struct search *s, uint64_t *reada)
 				return -ENOMEM;
 
 			BUG_ON(n == bio);
+			s->cache_miss = true;
 			generic_make_request(n);
 		}
 
@@ -5816,10 +5828,11 @@ static void __request_read(struct closure *cl)
 
 		BUG_ON(s->cache_bio && !s->cache_bio->bi_size);
 
+		s->cache_miss = true;
 		generic_make_request(bio);
-		atomic_long_inc(&op->d->cache_misses);
-	} else
-		atomic_long_inc(&op->d->cache_hits);
+	}
+
+	atomic_long_inc(&op->d->cache_accounting[s->skip][s->cache_miss]);
 
 	return_f(cl, NULL);
 }
@@ -5945,9 +5958,11 @@ write_attribute(trigger_gc);
 read_attribute(bucket_size);
 read_attribute(block_size);
 read_attribute(nbuckets);
-read_attribute(cache_hits);
 read_attribute(cache_hit_ratio);
+read_attribute(cache_hits);
 read_attribute(cache_misses);
+read_attribute(cache_bypass_hits);
+read_attribute(cache_bypass_misses);
 read_attribute(cache_readaheads);
 read_attribute(cache_miss_collisions);
 read_attribute(tree_depth);
@@ -6848,9 +6863,16 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 	d_hprint(sequential_cutoff_average);
 	d_printf(sequential_merge,	"%i");
 
-	sysfs_hprint(bypassed,	atomic_long_read(&d->sectors_bypassed) << 9);
 	sysfs_print(cache_hits,		atomic_long_read(&d->cache_hits));
 	sysfs_print(cache_misses,	atomic_long_read(&d->cache_misses));
+
+	sysfs_print(cache_bypass_hits,
+		    atomic_long_read(&d->cache_bypass_hits));
+	sysfs_print(cache_bypass_misses,
+		    atomic_long_read(&d->cache_bypass_misses));
+
+	sysfs_hprint(bypassed,	atomic_long_read(&d->sectors_bypassed) << 9);
+
 	sysfs_print(cache_hit_ratio,	cache_hit_ratio(d));
 	sysfs_print(cache_readaheads,
 		     atomic_long_read(&d->cache_readaheads));
@@ -7049,6 +7071,8 @@ static int register_dev_kobj(struct cached_dev *d)
 		&sysfs_bypassed,
 		&sysfs_cache_hits,
 		&sysfs_cache_misses,
+		&sysfs_cache_bypass_hits,
+		&sysfs_cache_bypass_misses,
 		&sysfs_cache_hit_ratio,
 		&sysfs_cache_readaheads,
 		&sysfs_cache_miss_collisions,
@@ -7337,6 +7361,8 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 	sysfs_hprint(bypassed,		sum_bdev(sectors_bypassed) << 9);
 	sysfs_print(cache_hits,		sum_bdev(cache_hits));
 	sysfs_print(cache_misses,	sum_bdev(cache_misses));
+	sysfs_print(cache_bypass_hits,	sum_bdev(cache_bypass_hits));
+	sysfs_print(cache_bypass_misses,sum_bdev(cache_bypass_misses));
 	sysfs_print(cache_hit_ratio,	cache_hit_ratio(c));
 	sysfs_print(cache_readaheads,	sum_bdev(cache_readaheads));
 	sysfs_print(cache_miss_collisions, sum_bdev(cache_miss_collisions));
@@ -7833,6 +7859,8 @@ static const char *register_cache_set(struct cache *ca)
 		&sysfs_bypassed,
 		&sysfs_cache_hits,
 		&sysfs_cache_misses,
+		&sysfs_cache_bypass_hits,
+		&sysfs_cache_bypass_misses,
 		&sysfs_cache_hit_ratio,
 		&sysfs_cache_readaheads,
 		&sysfs_cache_miss_collisions,

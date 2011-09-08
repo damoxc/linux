@@ -342,6 +342,7 @@ struct cache_set {
 	atomic_t		closing;
 	struct kobject		kobj;
 	struct kobject		internal;
+	struct kobject		accounting[4];
 	struct work_struct	unregister;
 	struct list_head	devices;
 
@@ -508,6 +509,55 @@ struct io {
 	sector_t		last;
 };
 
+/* We keep absolute totals of various statistics, and addionally a set of three
+ * rolling averages.
+ *
+ * Every so often, a timer goes off and rescales the rolling averages.
+ * accounting_rescale[] is how many times the timer has to go off before we
+ * rescale each set of numbers; that gets us half lives of 5 minutes, one hour,
+ * and one day.
+ *
+ * accounting_delay is how often the timer goes off - 22 times in 5 minutes,
+ * and accounting_weight is what we use to rescale:
+ *
+ * pow(31 / 32, 22) ~= 1/2
+ *
+ * So that we don't have to increment each set of numbers every time we (say)
+ * get a cache hit, we increment a single atomic_t and when the rescale
+ * function it runs it resets the atomic counter to 0 and adds its old value to
+ * each of the exported numbers.
+ *
+ * To reduce rounding error, the numbers in struct cache_accounting are all
+ * stored left shifted by 16, and scaled back in the sysfs show() function.
+ */
+
+static const unsigned accounting_rescale[]	= { 0, 1, 12, 288 };
+static const unsigned accounting_delay		= (HZ * 300) / 22;
+static const unsigned accounting_weight		= 32;
+
+static const char * const accounting_types[]	= {
+	"total", "five_minute", "hour", "day" };
+
+struct cache_accounting {
+	struct kobject		kobj;
+	unsigned		rescale;
+
+	union {
+		unsigned long	all[7];
+
+		struct {
+			unsigned long	cache_hits;
+			unsigned long	cache_misses;
+			unsigned long	cache_bypass_hits;
+			unsigned long	cache_bypass_misses;
+
+			unsigned long	cache_readaheads;
+			unsigned long	cache_miss_collisions;
+			unsigned long	sectors_bypassed;
+		};
+	};
+};
+
 struct cached_dev {
 	struct list_head	list;
 	struct cache_sb		sb;
@@ -535,21 +585,35 @@ struct cached_dev {
 	struct rw_semaphore	writeback_lock;
 	struct work_struct	refill;
 
-	atomic_long_t		sectors_bypassed;
-
 	union {
-		atomic_long_t	cache_accounting[2][2];
+		atomic_t	all[7];
+
+		atomic_t	stats[2][2];
 
 		struct {
-			atomic_long_t	cache_hits;
-			atomic_long_t	cache_misses;
-			atomic_long_t	cache_bypass_hits;
-			atomic_long_t	cache_bypass_misses;
+			atomic_t	cache_hits;
+			atomic_t	cache_misses;
+			atomic_t	cache_bypass_hits;
+			atomic_t	cache_bypass_misses;
+
+			atomic_t	cache_readaheads;
+			atomic_t	cache_miss_collisions;
+			atomic_t	sectors_bypassed;
 		};
 	};
 
-	atomic_long_t		cache_readaheads;
-	atomic_long_t		cache_miss_collisions;
+	union {
+		struct cache_accounting accounting[4];
+
+		struct {
+			struct cache_accounting total;
+			struct cache_accounting five_minute;
+			struct cache_accounting hour;
+			struct cache_accounting day;
+		};
+	};
+
+	struct timer_list	accounting_timer;
 
 	unsigned long		sequential_cutoff_average;
 	unsigned long		sequential_cutoff;
@@ -3883,7 +3947,7 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 			else if (bkey_cmp(j, k) < 0)
 				cut_front(j, k);
 			else {
-				atomic_long_inc(&op->d->cache_miss_collisions);
+				atomic_inc(&op->d->cache_miss_collisions);
 				return true;
 			}
 
@@ -5653,7 +5717,7 @@ rescale:
 	rescale_heap(d->c, bio_sectors(bio));
 	return;
 skip:
-	atomic_long_add(bio_sectors(bio), &d->sectors_bypassed);
+	atomic_add(bio_sectors(bio), &d->sectors_bypassed);
 	s->skip = true;
 }
 
@@ -5737,7 +5801,7 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 
 	pr_debug("reading %i + %i sectors", bio_sectors(last_bio),
 		 bio_sectors(bio));
-	atomic_long_inc(&s->op.d->cache_readaheads);
+	atomic_inc(&s->op.d->cache_readaheads);
 
 	closure_get(&s->cl);
 	submit_bio(READ, bio);
@@ -5819,20 +5883,19 @@ static void __request_read(struct closure *cl)
 
 	s->lookup_done = true;
 
-	if (!s->cache_hit) {
+	if (!s->cache_hit && !s->skip) {
 		reada = min_t(uint64_t, reada,
 			      bio->bi_sector + (op->d->readahead >> 9));
 
-		if (!s->skip)
-			do_readahead(s, bio, reada - bio_end(bio));
+		do_readahead(s, bio, reada - bio_end(bio));
+	}
 
-		BUG_ON(s->cache_bio && !s->cache_bio->bi_size);
-
+	if (!s->cache_hit) {
 		s->cache_miss = true;
 		generic_make_request(bio);
 	}
 
-	atomic_long_inc(&op->d->cache_accounting[s->skip][s->cache_miss]);
+	atomic_inc(&op->d->stats[s->skip][s->cache_miss]);
 
 	return_f(cl, NULL);
 }
@@ -5958,13 +6021,6 @@ write_attribute(trigger_gc);
 read_attribute(bucket_size);
 read_attribute(block_size);
 read_attribute(nbuckets);
-read_attribute(cache_hit_ratio);
-read_attribute(cache_hits);
-read_attribute(cache_misses);
-read_attribute(cache_bypass_hits);
-read_attribute(cache_bypass_misses);
-read_attribute(cache_readaheads);
-read_attribute(cache_miss_collisions);
 read_attribute(tree_depth);
 read_attribute(root_usage_percent);
 read_attribute(priority_stats);
@@ -5974,7 +6030,6 @@ read_attribute(cache_available_percent);
 read_attribute(written);
 read_attribute(btree_written);
 read_attribute(metadata_written);
-read_attribute(bypassed);
 read_attribute(btree_avg_keys_written);
 read_attribute(active_journal_entries);
 
@@ -6007,6 +6062,15 @@ rw_attribute(label);
 rw_attribute(readahead);
 rw_attribute(io_error_limit);
 rw_attribute(io_error_halflife);
+
+read_attribute(cache_hits);
+read_attribute(cache_misses);
+read_attribute(cache_bypass_hits);
+read_attribute(cache_bypass_misses);
+read_attribute(cache_hit_ratio);
+read_attribute(cache_readaheads);
+read_attribute(cache_miss_collisions);
+read_attribute(bypassed);
 
 static int btree_check(struct btree *b, struct btree_op *op)
 {
@@ -6837,17 +6901,113 @@ found:
 	return 0;
 }
 
+static void scale_accounting(unsigned long data)
+{
+	struct cached_dev *d = (struct cached_dev *) data;
+
+	for (int i = 0; i < 7; i++) {
+		unsigned long t = atomic_xchg(&d->all[i], 0);
+		t <<= 16;
+
+		for (int j = 0; j < 4; j++)
+			d->accounting[j].all[i] += t;
+	}
+
+	for (int j = 1; j < 4; j++) {
+		struct cache_accounting *a = &d->accounting[j];
+
+		if (++a->rescale == accounting_rescale[j]) {
+			a->rescale = 0;
+
+			for (int i = 0; i < 7; i++) {
+				a->all[i] *= accounting_weight - 1;
+				a->all[i] /= accounting_weight;
+			}
+		}
+	}
+
+	d->accounting_timer.expires += accounting_delay;
+	add_timer(&d->accounting_timer);
+}
+
+static ssize_t show_dev_accounting(struct kobject *kobj, struct attribute *attr,
+				   char *buf)
+{
+	struct cache_accounting *a =
+		container_of(kobj, struct cache_accounting, kobj);
+
+#define a_print(var)		sysfs_print(var, a->var >> 16)
+
+	a_print(cache_hits);
+	a_print(cache_misses);
+	a_print(cache_bypass_hits);
+	a_print(cache_bypass_misses);
+
+	sysfs_print(cache_hit_ratio,
+		    DIV_SAFE(a->cache_hits * 100,
+			     a->cache_hits + a->cache_misses) >> 16);
+
+	a_print(cache_readaheads);
+	a_print(cache_miss_collisions);
+	sysfs_hprint(bypassed,	(a->sectors_bypassed >> 16) << 9);
+
+	return 0;
+}
+
+static ssize_t show_cache_set_accounting(struct kobject *kobj,
+					 struct attribute *attr, char *buf)
+{
+	struct cache_set *c = container_of(kobj->parent, struct cache_set,
+					   kobj);
+	int idx = kobj - c->accounting;
+
+#define sum_bdev(stat)					\
+({							\
+	struct cached_dev *d;				\
+	unsigned long ret = 0;				\
+	list_for_each_entry(d, &c->devices, list)	\
+		ret += d->accounting[idx].stat;		\
+	ret >> 16;					\
+})
+
+	unsigned cache_hit_ratio(struct cache_set *c)
+	{
+		unsigned long hits = sum_bdev(cache_hits);
+		return DIV_SAFE(hits * 100, hits + sum_bdev(cache_misses));
+	}
+
+	sysfs_print(cache_hits,		sum_bdev(cache_hits));
+	sysfs_print(cache_misses,	sum_bdev(cache_misses));
+	sysfs_print(cache_bypass_hits,	sum_bdev(cache_bypass_hits));
+	sysfs_print(cache_bypass_misses, sum_bdev(cache_bypass_misses));
+	sysfs_print(cache_hit_ratio,	cache_hit_ratio(c));
+	sysfs_print(cache_readaheads,	sum_bdev(cache_readaheads));
+	sysfs_print(cache_miss_collisions, sum_bdev(cache_miss_collisions));
+	sysfs_hprint(bypassed,		sum_bdev(sectors_bypassed) << 9);
+
+	return 0;
+}
+
+static struct attribute *accounting_files[] = {
+	&sysfs_cache_hits,
+	&sysfs_cache_misses,
+	&sysfs_cache_bypass_hits,
+	&sysfs_cache_bypass_misses,
+	&sysfs_cache_hit_ratio,
+	&sysfs_cache_readaheads,
+	&sysfs_cache_miss_collisions,
+	&sysfs_bypassed,
+	NULL
+};
+
+static void unregister_fake(struct kobject *k)
+{
+}
+
 static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 {
 	struct cached_dev *d = container_of(kobj, struct cached_dev, kobj);
 	const char *states[] = { "no cache", "clean", "dirty", "inconsistent" };
-
-	unsigned cache_hit_ratio(struct cached_dev *d)
-	{
-		unsigned long hits = atomic_long_read(&d->cache_hits);
-		unsigned long misses = atomic_long_read(&d->cache_misses);
-		return DIV_SAFE(hits * 100, hits + misses);
-	}
 
 #define d_printf(var, fmt)	sysfs_printf(var, fmt, d->var)
 #define d_print(var)		sysfs_print(var, d->var)
@@ -6859,29 +7019,13 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 	d_print(writeback_delay);
 	d_print(writeback_percent);
 
+	d_printf(sequential_merge,	"%i");
 	d_hprint(sequential_cutoff);
 	d_hprint(sequential_cutoff_average);
-	d_printf(sequential_merge,	"%i");
+	d_hprint(readahead);
 
-	sysfs_print(cache_hits,		atomic_long_read(&d->cache_hits));
-	sysfs_print(cache_misses,	atomic_long_read(&d->cache_misses));
-
-	sysfs_print(cache_bypass_hits,
-		    atomic_long_read(&d->cache_bypass_hits));
-	sysfs_print(cache_bypass_misses,
-		    atomic_long_read(&d->cache_bypass_misses));
-
-	sysfs_hprint(bypassed,	atomic_long_read(&d->sectors_bypassed) << 9);
-
-	sysfs_print(cache_hit_ratio,	cache_hit_ratio(d));
-	sysfs_print(cache_readaheads,
-		     atomic_long_read(&d->cache_readaheads));
-	sysfs_print(cache_miss_collisions,
-		     atomic_long_read(&d->cache_miss_collisions));
 	sysfs_print(running,		atomic_read(&d->running));
 	sysfs_print(state,		states[BDEV_STATE(&d->sb)]);
-
-	d_hprint(readahead);
 
 	if (attr == &sysfs_label) {
 		memcpy(buf, d->sb.label, SB_LABEL_SIZE);
@@ -6914,13 +7058,8 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 	d_strtoi_h(sequential_cutoff_average);
 	d_strtoi_h(readahead);
 
-	if (attr == &sysfs_clear_stats) {
-		atomic_long_set(&d->sectors_bypassed, 0);
-		atomic_long_set(&d->cache_hits, 0);
-		atomic_long_set(&d->cache_misses, 0);
-		atomic_long_set(&d->cache_readaheads, 0);
-		atomic_long_set(&d->cache_miss_collisions, 0);
-	}
+	if (attr == &sysfs_clear_stats)
+		memset(&d->total.all, 0, sizeof(unsigned long) * 7);
 
 	if (attr == &sysfs_running &&
 	    strtoul_or_return(buffer))
@@ -7033,6 +7172,12 @@ static struct cached_dev *alloc_backing_dev(void)
 	init_rwsem(&d->writeback_lock);
 	sema_init(&d->sb_write, 1);
 
+	init_timer(&d->accounting_timer);
+	d->accounting_timer.expires	= jiffies + accounting_delay;
+	d->accounting_timer.data	= (unsigned long) d;
+	d->accounting_timer.function	= scale_accounting;
+	add_timer(&d->accounting_timer);
+
 	d->dirty			= RB_ROOT;
 	d->writeback_running		= true;
 	d->writeback_delay		= 30;
@@ -7068,14 +7213,6 @@ static int register_dev_kobj(struct cached_dev *d)
 		&sysfs_sequential_cutoff,
 		&sysfs_sequential_cutoff_average,
 		&sysfs_sequential_merge,
-		&sysfs_bypassed,
-		&sysfs_cache_hits,
-		&sysfs_cache_misses,
-		&sysfs_cache_bypass_hits,
-		&sysfs_cache_bypass_misses,
-		&sysfs_cache_hit_ratio,
-		&sysfs_cache_readaheads,
-		&sysfs_cache_miss_collisions,
 		&sysfs_clear_stats,
 		&sysfs_running,
 		&sysfs_state,
@@ -7093,15 +7230,34 @@ static int register_dev_kobj(struct cached_dev *d)
 		.default_attrs = files
 	};
 
+	static const struct sysfs_ops accounting_ops = {
+		.show = show_dev_accounting,
+		.store = NULL
+	};
+	static struct kobj_type accounting_obj = {
+		.release = unregister_fake,
+		.sysfs_ops = &accounting_ops,
+		.default_attrs = accounting_files
+	};
+
 	struct cache_set *c;
 	struct kobject *p = &part_to_dev(d->bdev->bd_part)->kobj;
-	int ret = kobject_init_and_add(&d->kobj, &dev_obj, p, "bcache");
 
-	if (!ret) {
-		list_add(&d->list, &uncached_devices);
-		list_for_each_entry(c, &cache_sets, list)
-			register_dev_on_set(c, d);
+	int ret = kobject_init_and_add(&d->kobj, &dev_obj, p, "bcache");
+	if (ret)
+		return ret;
+
+	for (int i = 0; i < 4; i++) {
+		ret = kobject_init_and_add(&d->accounting[i].kobj,
+					   &accounting_obj, &d->kobj,
+					   "stats_%s", accounting_types[i]);
+		if (ret)
+			return ret;
 	}
+
+	list_add(&d->list, &uncached_devices);
+	list_for_each_entry(c, &cache_sets, list)
+		register_dev_on_set(c, d);
 
 	return ret;
 }
@@ -7252,24 +7408,9 @@ err:
 
 /* Cache set */
 
-#define sum_bdev(stat)					\
-({							\
-	struct cached_dev *d;				\
-	size_t ret = 0;					\
-	list_for_each_entry(d, &c->devices, list)	\
-		ret += atomic_long_read(&d->stat);	\
-	ret;						\
-})
-
 static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 				char *buf)
 {
-	unsigned cache_hit_ratio(struct cache_set *c)
-	{
-		unsigned long hits = sum_bdev(cache_hits);
-		return DIV_SAFE(hits * 100, hits + sum_bdev(cache_misses));
-	}
-
 	unsigned root_usage(struct cache_set *c)
 	{
 		unsigned bytes = 0;
@@ -7357,15 +7498,6 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 	/* See count_io_errors for why 88 */
 	sysfs_print(io_error_halflife,		c->error_decay * 88);
 	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
-
-	sysfs_hprint(bypassed,		sum_bdev(sectors_bypassed) << 9);
-	sysfs_print(cache_hits,		sum_bdev(cache_hits));
-	sysfs_print(cache_misses,	sum_bdev(cache_misses));
-	sysfs_print(cache_bypass_hits,	sum_bdev(cache_bypass_hits));
-	sysfs_print(cache_bypass_misses,sum_bdev(cache_bypass_misses));
-	sysfs_print(cache_hit_ratio,	cache_hit_ratio(c));
-	sysfs_print(cache_readaheads,	sum_bdev(cache_readaheads));
-	sysfs_print(cache_miss_collisions, sum_bdev(cache_miss_collisions));
 
 	if (attr == &sysfs_bset_tree_stats) {
 		struct btree_op op;
@@ -7570,10 +7702,6 @@ static void unregister_cache_set(struct kobject *k)
 		kobject_put(&ca->kobj);
 
 	free_cache_set(c);
-}
-
-static void unregister_cache_set_internal(struct kobject *k)
-{
 }
 
 static void unregister_cache_set_work(struct work_struct *w)
@@ -7855,15 +7983,6 @@ static const char *register_cache_set(struct cache *ca)
 		&sysfs_io_error_limit,
 		&sysfs_io_error_halflife,
 		&sysfs_clear_stats,
-
-		&sysfs_bypassed,
-		&sysfs_cache_hits,
-		&sysfs_cache_misses,
-		&sysfs_cache_bypass_hits,
-		&sysfs_cache_bypass_misses,
-		&sysfs_cache_hit_ratio,
-		&sysfs_cache_readaheads,
-		&sysfs_cache_miss_collisions,
 		NULL
 	};
 	static const struct sysfs_ops ops = {
@@ -7898,9 +8017,19 @@ static const char *register_cache_set(struct cache *ca)
 		.store = store_cache_set_internal
 	};
 	static struct kobj_type internal_obj = {
-		.release = unregister_cache_set_internal,
+		.release = unregister_fake,
 		.sysfs_ops = &internal_ops,
 		.default_attrs = internal_files
+	};
+
+	static const struct sysfs_ops accounting_ops = {
+		.show = show_cache_set_accounting,
+		.store = NULL
+	};
+	static struct kobj_type accounting_obj = {
+		.release = unregister_fake,
+		.sysfs_ops = &accounting_ops,
+		.default_attrs = accounting_files
 	};
 
 	char buf[12];
@@ -7936,6 +8065,12 @@ static const char *register_cache_set(struct cache *ca)
 	if (kobject_init_and_add(&cs->internal, &internal_obj,
 				 &cs->kobj, "internal"))
 		goto err;
+
+	for (int i = 0; i < 4; i++)
+		if (kobject_init_and_add(&cs->accounting[i],
+					 &accounting_obj, &cs->kobj,
+					 "stats_%s", accounting_types[i]))
+			goto err;
 
 	list_add(&cs->list, &cache_sets);
 found:

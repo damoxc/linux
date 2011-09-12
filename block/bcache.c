@@ -4771,7 +4771,7 @@ static void btree_journal_write(struct cache_set *s, struct journal_write *w)
 		bio->bi_private = w;
 		bio_map(bio, w->data);
 
-		pr_debug("write to sector %lu", bio->bi_sector);
+		pr_debug("write to sector %llu", (uint64_t) bio->bi_sector);
 		atomic_inc(&s->journal.io);
 		bio_submit_split(bio, &s->journal.io, s->bio_split);
 	}

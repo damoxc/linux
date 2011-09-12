@@ -22,6 +22,7 @@
 
 #define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
 
+#include <linux/bitops.h>
 #include <linux/blkdev.h>
 #include <linux/blktrace_api.h>
 #include <linux/buffer_head.h>
@@ -218,17 +219,26 @@ struct jset {
 	};
 };
 
+/* Only used for holding the journal entries we read in btree_journal_read()
+ * during cache_registration
+ */
 struct journal_replay {
 	struct list_head	list;
 	atomic_t		*pin;
 	struct jset		j;
 };
 
+/* For keeping track of the space in the journal that's used by the open
+ * journal entries
+ */
 struct journal_seq {
 	uint64_t	seq;
 	sector_t	sector;
 };
 
+/* We put two of these in struct journal; we used them for writes to the
+ * journal that are being staged or in flight.
+ */
 struct journal_write {
 	BKEY_PADDED(key);
 
@@ -274,6 +284,7 @@ struct uuid_entry {
 
 #define SB_LABEL_SIZE		32
 #define SB_JOURNAL_BUCKETS	256
+/* SB_JOURNAL_BUCKETS must be divisible by BITS_PER_LONG */
 
 struct cache_sb {
 	uint64_t		csum;
@@ -304,7 +315,10 @@ struct cache_sb {
 	uint32_t		last_mount;	/* time_t */
 
 	uint16_t		first_bucket;
-	uint16_t		keys;		/* number of journal buckets */
+	union {
+		uint16_t	njournal_buckets;
+		uint16_t	keys;
+	};
 	uint64_t		d[SB_JOURNAL_BUCKETS];	/* journal buckets */
 };
 
@@ -885,7 +899,7 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 #define set_bytes(i)		__set_bytes(i, i->keys)
 
 #define __set_blocks(i, k, c)	DIV_ROUND_UP(__set_bytes(i, k), block_bytes(c))
-#define set_blocks(i, c)	__set_blocks(i, i->keys, c)
+#define set_blocks(i, c)	__set_blocks(i, (i)->keys, c)
 
 #define node(i, j)		((struct bkey *) ((i)->d + (j)))
 #define end(i)			node(i, (i)->keys)
@@ -4367,92 +4381,183 @@ static void btree_journal_read_endio(struct bio *bio, int error)
 	closure_put(cl, delayed);
 }
 
-static int btree_journal_read(struct cache_set *s, struct list_head *list,
-			      struct btree_op *op)
+static int btree_journal_read_bucket(struct cache *ca, struct list_head *list,
+				     struct btree_op *op, sector_t bucket)
 {
-	struct cache *c;
-	struct closure *cl = &op->cl;
+	struct bio *bio = &ca->journal_bio;
 	struct journal_replay *i;
-	struct jset *j, *data = s->journal.w[0].data;
+	struct jset *j, *data = ca->set->journal.w[0].data;
+	unsigned len, left, offset = 0;
+	int ret = 0;
 
-	for_each_cache(c, s) {
-		struct bio *bio = &c->journal_bio;
-		sector_t offset = c->journal_area_start;
-		unsigned len, left;
+	pr_debug("reading %llu", (uint64_t) bucket);
+	bucket = bucket_to_sector(ca->set, ca->sb.d[bucket]);
 
-		while (offset < c->journal_area_end) {
-reread:			left = c->journal_area_end - offset;
-			len = min_t(unsigned, left, PAGE_SECTORS * 8);
+	while (offset < ca->sb.bucket_size) {
+reread:		left = ca->sb.bucket_size - offset;
+		len = min_t(unsigned, left, PAGE_SECTORS * 8);
 
-			bio_reset(bio);
-			bio->bi_sector	= offset;
-			bio->bi_bdev	= c->bdev;
-			bio->bi_rw	= READ;
-			bio->bi_size	= len << 9;
+		bio_reset(bio);
+		bio->bi_sector	= bucket + offset;
+		bio->bi_bdev	= ca->bdev;
+		bio->bi_rw	= READ;
+		bio->bi_size	= len << 9;
 
-			bio->bi_end_io	= btree_journal_read_endio;
-			bio->bi_private = cl;
-			bio_map(bio, data);
+		bio->bi_end_io	= btree_journal_read_endio;
+		bio->bi_private = &op->cl;
+		bio_map(bio, data);
 
-			closure_get(cl);
-			closure_bio_submit(bio, cl, s->bio_split);
-			closure_sync(cl);
+		closure_get(&op->cl);
+		closure_bio_submit(bio, &op->cl, ca->set->bio_split);
+		closure_sync(&op->cl);
 
-			j = data;
-			while (len) {
-				struct list_head *where = list;
-				size_t blocks = 1, bytes = set_bytes(j);
+		/* This function could be simpler now since we no longer write
+		 * journal entries that overlap bucket boundaries; this means
+		 * the start of a bucket will always have a valid journal entry
+		 * if it has any journal entries at all.
+		 */
 
-				if (j->magic != jset_magic(s))
-					goto next_set;
+		j = data;
+		while (len) {
+			struct list_head *where;
+			size_t blocks = 1, bytes = set_bytes(j);
 
-				if (bytes > left << 9)
-					goto next_set;
+			if (j->magic != jset_magic(ca->set))
+				goto next_set;
 
-				if (bytes > len << 9)
-					goto reread;
+			if (bytes > left << 9)
+				goto next_set;
 
-				if (j->csum != csum_set(j))
-					goto next_set;
+			if (bytes > len << 9)
+				goto reread;
 
-				blocks = set_blocks(j, s);
+			if (j->csum != csum_set(j))
+				goto next_set;
 
-				while (!list_empty(list)) {
-					i = list_first_entry(list,
-						struct journal_replay, list);
-					if (i->j.seq >= j->last_seq)
-						break;
-					list_del(&i->list);
-					kfree(i);
-				}
+			blocks = set_blocks(j, ca->set);
 
-				list_for_each_entry_reverse(i, list, list) {
-					if (j->seq == i->j.seq)
-						goto next_set;
-
-					if (j->seq < i->j.last_seq)
-						goto next_set;
-
-					if (j->seq > i->j.seq) {
-						where = &i->list;
-						break;
-					}
-				}
-
-				i = kmalloc(offsetof(struct journal_replay, j) +
-					    bytes, GFP_KERNEL);
-				if (!i)
-					return -ENOMEM;
-				memcpy(&i->j, j, bytes);
-				list_add(&i->list, where);
-next_set:
-				offset	+= blocks * s->sb.block_size;
-				len	-= blocks * s->sb.block_size;
-				j = ((void *) j) + blocks * block_bytes(s);
+			while (!list_empty(list)) {
+				i = list_first_entry(list,
+					struct journal_replay, list);
+				if (i->j.seq >= j->last_seq)
+					break;
+				list_del(&i->list);
+				kfree(i);
 			}
+
+			list_for_each_entry_reverse(i, list, list) {
+				if (j->seq == i->j.seq)
+					goto next_set;
+
+				if (j->seq < i->j.last_seq)
+					goto next_set;
+
+				if (j->seq > i->j.seq) {
+					where = &i->list;
+					goto add;
+				}
+			}
+
+			where = list;
+add:
+			i = kmalloc(offsetof(struct journal_replay, j) +
+				    bytes, GFP_KERNEL);
+			if (!i)
+				return -ENOMEM;
+			memcpy(&i->j, j, bytes);
+			list_add(&i->list, where);
+			ret = 1;
+next_set:
+			offset	+= blocks * ca->sb.block_size;
+			len	-= blocks * ca->sb.block_size;
+			j = ((void *) j) + blocks * block_bytes(ca);
 		}
 	}
 
+	return ret;
+}
+
+static int btree_journal_read(struct cache_set *c, struct list_head *list,
+			      struct btree_op *op)
+{
+#define read_bucket(b)							\
+	({								\
+		int ret = btree_journal_read_bucket(ca, list, op, b);	\
+		__set_bit(b, bitmap);					\
+		if (ret < 0)						\
+			goto err;					\
+		ret;							\
+	})
+
+	struct cache *ca;
+
+	for_each_cache(ca, c) {
+		unsigned long bitmap[SB_JOURNAL_BUCKETS / BITS_PER_LONG];
+		unsigned l, r, m;
+
+		bitmap_zero(bitmap, SB_JOURNAL_BUCKETS);
+		pr_debug("%u journal buckets", ca->sb.njournal_buckets);
+
+		/* Read journal buckets ordered by golden ratio hash to quickly
+		 * find a sequence of buckets with valid journal entries
+		 */
+		for (unsigned i = 0; i < ca->sb.njournal_buckets; i++) {
+			l = (i * 2654435769U) % ca->sb.njournal_buckets;
+
+			if (test_bit(l, bitmap))
+				break;
+
+			if (read_bucket(l))
+				goto bsearch;
+		}
+
+		/* If that fails, check all the buckets we haven't checked
+		 * already
+		 */
+		pr_debug("falling back to linear search");
+
+		for (l = 0; l < ca->sb.njournal_buckets; l++) {
+			if (test_bit(l, bitmap))
+				continue;
+
+			if (read_bucket(l))
+				goto bsearch;
+		}
+bsearch:
+		/* Binary search */
+		m = r = find_next_bit(bitmap, ca->sb.njournal_buckets, l + 1);
+		pr_debug("starting binary search, l %u r %u", l, r);
+
+		while (l + 1 < r) {
+			m = (l + r) >> 1;
+
+			if (read_bucket(m))
+				l = m;
+			else
+				r = m;
+		}
+
+		/* Read buckets in reverse order until we stop finding more
+		 * journal entries
+		 */
+		pr_debug("finishing up");
+		l = m;
+
+		while (1) {
+			if (!l--)
+				l = ca->sb.njournal_buckets - 1;
+
+			if (l == m)
+				break;
+
+			if (test_bit(l, bitmap))
+				continue;
+
+			if (!read_bucket(l))
+				break;
+		}
+	}
+err:
 	return 0;
 }
 
@@ -4503,8 +4608,9 @@ static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 	list_for_each_entry(i, list, list) {
 		BUG_ON(atomic_read(i->pin) != 1);
 
-		BUG_ON(last + 1 > i->j.seq);
-		if (last + 1 != i->j.seq)
+		last++;
+		BUG_ON(last > i->j.seq);
+		if (last != i->j.seq)
 			printk(KERN_ERR "bcache: journal entries %llu-%llu "
 			       "missing! (replaying %llu-%llu)\n",
 			       last, i->j.seq, start, end);

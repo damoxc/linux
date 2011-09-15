@@ -3104,15 +3104,22 @@ static struct btree *get_bucket(struct cache_set *c, struct bkey *k,
 				int level, struct btree_op *op)
 {
 	int nread;
-	bool write = level <= op->lock;
+	bool write = false;
+	struct closure *cl = NULL;
 	struct btree *b;
+
+	if (op) {
+		cl = &op->cl;
+		write = level <= op->lock;
+	}
+
 	BUG_ON(level < 0);
 retry:
 	b = find_bucket(c, k);
 
 	if (!b) {
 		spin_lock(&c->bucket_lock);
-		b = alloc_bucket(c, k, &op->cl);
+		b = alloc_bucket(c, k, cl);
 		if (!b)
 			goto retry;
 		if (IS_ERR(b))
@@ -3133,6 +3140,11 @@ retry:
 	}
 
 	b->jiffies = jiffies;
+
+	if (!cl) {
+		rw_unlock(write, b);
+		return NULL;
+	}
 
 	for (int i = 0; i < 4 && b->tree[i].size; i++)
 		prefetch(b->tree[i].key);
@@ -6266,6 +6278,7 @@ read_attribute(bypassed);
 
 static int btree_check(struct btree *b, struct btree_op *op)
 {
+	int ret;
 	struct bkey *k;
 
 	for_each_key_filter(b, k, ptr_invalid) {
@@ -6285,12 +6298,21 @@ static int btree_check(struct btree *b, struct btree_op *op)
 		btree_mark_key(b, k);
 	}
 
-	if (b->level)
-		for_each_key_filter(b, k, ptr_bad) {
-			int ret = btree(check, k, op, b, op);
+	if (b->level) {
+		k = next_recurse_key(b, &ZERO_KEY);
+
+		while (k) {
+			struct bkey *p = next_recurse_key(b, k);
+			if (p)
+				get_bucket(b->c, p, b->level - 1, NULL);
+
+			ret = btree(check, k, op, b, op);
 			if (ret)
 				return ret;
+
+			k = p;
 		}
+	}
 
 	return 0;
 }

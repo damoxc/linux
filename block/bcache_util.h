@@ -552,4 +552,7 @@ do {									\
 uint64_t crc64_update(uint64_t, const void *, size_t);
 uint64_t crc64(const void *, size_t);
 
+unsigned popcount_64(uint64_t);
+unsigned popcount_32(uint32_t);
+
 #endif /* _BCACHE_UTIL_H */

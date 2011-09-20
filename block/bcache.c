@@ -418,6 +418,11 @@ struct cache_set {
 
 	struct journal		journal;
 
+#define CONGESTED_MAX		1024
+	unsigned		congested_us;
+	atomic_t		congested;
+	ktime_t			congested_last;
+
 	atomic_long_t		writeback_keys_done;
 	atomic_long_t		writeback_keys_failed;
 	atomic_long_t		btree_write_count;
@@ -629,7 +634,6 @@ struct cached_dev {
 
 	struct timer_list	accounting_timer;
 
-	unsigned long		sequential_cutoff_average;
 	unsigned long		sequential_cutoff;
 	unsigned		sequential_merge:1;
 
@@ -747,6 +751,7 @@ struct keylist {
 };
 
 struct bbio {
+	ktime_t			time;
 	union {
 		struct bkey	key;
 		uint64_t	_pad[3];
@@ -1580,7 +1585,8 @@ static void __submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
 
 	bkey_copy(&b->key, k);
 
-	bio->bi_bdev = PTR_CACHE(c, k, 0)->bdev;
+	bio->bi_bdev	= PTR_CACHE(c, k, 0)->bdev;
+	b->time		= ktime_get();
 
 	generic_make_request(bio);
 }
@@ -1649,6 +1655,23 @@ static void count_bio_errors(struct cache_set *c, struct bio *bio,
 	       (bio->bi_destructor != bbio_destructor) &&
 	       (bio->bi_destructor != (void *) c->bio_split));
 	BUG_ON(KEY_PTRS(&b->key) != 1);
+
+	if (c->congested_us) {
+		int us, congested;
+		ktime_t t = ktime_get();
+
+		us = ktime_us_delta(t, b->time);
+		congested = atomic_read(&c->congested);
+
+		if (us > c->congested_us) {
+			int ms = us / 1024;
+			c->congested_last = t;
+
+			ms = min(ms, CONGESTED_MAX + congested);
+			atomic_sub(ms, &c->congested);
+		} else if (congested < 0)
+			atomic_inc(&c->congested);
+	}
 
 	count_io_errors(ca, error, m);
 }
@@ -5737,6 +5760,28 @@ static void readahead_endio(struct bio *bio, int error)
 	request_endio(bio, 0);
 }
 
+static int get_congested(struct cache_set *c)
+{
+	static const unsigned fract_bits = 6;
+	unsigned fract;
+	int ret, i = atomic_read(&c->congested);
+
+	i += ktime_us_delta(ktime_get(), c->congested_last) / 1024;
+
+	if (i >= 0)
+		return 0;
+
+	i += CONGESTED_MAX;
+
+	fract = i & ((1 << fract_bits) - 1);
+	i >>= fract_bits;
+
+	ret = 1 << i;
+	ret += ((1 << i) * fract) >> fract_bits;
+
+	return ret;
+}
+
 static void check_should_skip(struct search *s)
 {
 	void add_sequential(struct task_struct *t)
@@ -5758,24 +5803,31 @@ static void check_should_skip(struct search *s)
 
 	struct cached_dev *d = s->op.d;
 	struct bio *bio = &s->bio.bio;
+	int cutoff;
 
 	if (atomic_read(&d->closing) ||
 	    d->c->gc_stats.in_use > CUTOFF_CACHE_ADD)
 		goto skip;
 
-	if (bio->bi_sector   % d->c->sb.block_size ||
-	    bio_sectors(bio) % d->c->sb.block_size) {
+	if (bio->bi_sector   & (d->c->sb.block_size - 1) ||
+	    bio_sectors(bio) & (d->c->sb.block_size - 1)) {
 		pr_debug("skipping unaligned io");
 		goto skip;
 	}
 
-	if (!d->sequential_cutoff &&
-	    !d->sequential_cutoff_average)
-		goto rescale;
+	cutoff = get_congested(d->c);
 
-	if (s->op.insert_type & INSERT_WRITE &&
-	    (d->writeback && (bio->bi_rw & REQ_SYNC)))
-		goto rescale;
+	if (!cutoff) {
+		cutoff = d->sequential_cutoff >> 9;
+
+		if (!cutoff)
+			goto rescale;
+
+		if (d->writeback &&
+		    (bio->bi_rw & REQ_WRITE) &&
+		    (bio->bi_rw & REQ_SYNC))
+			goto rescale;
+	}
 
 	if (d->sequential_merge) {
 		struct hlist_node *cursor;
@@ -5788,7 +5840,7 @@ static void check_should_skip(struct search *s)
 			    time_before(jiffies, i->jiffies))
 				goto found;
 
-		i = list_first_entry(&s->op.d->io_lru, struct io, lru);
+		i = list_first_entry(&d->io_lru, struct io, lru);
 
 		add_sequential(s->task);
 		i->sequential = 0;
@@ -5811,12 +5863,10 @@ found:
 		add_sequential(s->task);
 	}
 
-	if (d->sequential_cutoff &&
-	    d->sequential_cutoff <= s->task->sequential_io)
-		goto skip;
+	cutoff -= popcount_32(get_random_int());
 
-	if (d->sequential_cutoff_average &&
-	    d->sequential_cutoff_average <= s->task->sequential_io_avg)
+	if (cutoff <= (int) (max(s->task->sequential_io,
+				 s->task->sequential_io_avg) >> 9))
 		goto skip;
 
 rescale:
@@ -6010,7 +6060,6 @@ static void request_read(struct search *s)
 {
 	s->cl.fn		= request_read_done;
 	s->op.insert_type	= INSERT_READ;
-	check_should_skip(s);
 
 	__request_read(&s->op.cl);
 }
@@ -6021,7 +6070,6 @@ static void request_write(struct search *s)
 
 	s->cl.fn		= bio_complete;
 	s->op.insert_type	= INSERT_WRITE;
-	check_should_skip(s);
 	down_read_non_owner(&s->op.d->writeback_lock);
 
 	if (in_writeback(s->op.d, bio->bi_sector, bio_sectors(bio))) {
@@ -6152,9 +6200,10 @@ read_attribute(state);
 read_attribute(writeback_keys_done);
 read_attribute(writeback_keys_failed);
 read_attribute(io_errors);
+read_attribute(congested);
+rw_attribute(congested_threshold_us);
 
 rw_attribute(sequential_cutoff);
-rw_attribute(sequential_cutoff_average);
 rw_attribute(sequential_merge);
 rw_attribute(writeback);
 rw_attribute(writeback_metadata);
@@ -7127,7 +7176,6 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 
 	d_printf(sequential_merge,	"%i");
 	d_hprint(sequential_cutoff);
-	d_hprint(sequential_cutoff_average);
 	d_hprint(readahead);
 
 	sysfs_print(running,		atomic_read(&d->running));
@@ -7161,7 +7209,6 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 
 	d_strtoul(sequential_merge);
 	d_strtoi_h(sequential_cutoff);
-	d_strtoi_h(sequential_cutoff_average);
 	d_strtoi_h(readahead);
 
 	if (attr == &sysfs_clear_stats)
@@ -7290,7 +7337,6 @@ static struct cached_dev *alloc_backing_dev(void)
 
 	d->sequential_merge		= true;
 	d->sequential_cutoff		= 4 << 20;
-	d->sequential_cutoff_average	= 4 << 20;
 
 	INIT_LIST_HEAD(&d->io_lru);
 	d->sb_bio.bi_io_vec = d->sb_bio.bi_inline_vecs;
@@ -7317,7 +7363,6 @@ static int register_dev_kobj(struct cached_dev *d)
 		&sysfs_writeback_delay,
 		&sysfs_writeback_percent,
 		&sysfs_sequential_cutoff,
-		&sysfs_sequential_cutoff_average,
 		&sysfs_sequential_merge,
 		&sysfs_clear_stats,
 		&sysfs_running,
@@ -7403,6 +7448,7 @@ static int bcache_make_request(struct request_queue *q, struct bio *bio)
 		return 1;
 
 	s = do_bio_hook(bio, d);
+	check_should_skip(s);
 
 	(bio->bi_rw & REQ_WRITE ? request_write : request_read)(s);
 	return 0;
@@ -7603,6 +7649,9 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 	sysfs_print(io_error_limit,		c->error_limit);
 	/* See count_io_errors for why 88 */
 	sysfs_print(io_error_halflife,		c->error_decay * 88);
+	sysfs_hprint(congested,
+		     ((uint64_t) get_congested(c)) << 9);
+	sysfs_print(congested_threshold_us,	c->congested_us);
 	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
 
 	if (attr == &sysfs_bset_tree_stats) {
@@ -7677,6 +7726,8 @@ static ssize_t __store_cache_set(struct cache_set *c, struct attribute *attr,
 	if (attr == &sysfs_trigger_gc)
 		queue_work(delayed, &c->gc_work);
 
+	sysfs_strtoul(congested_threshold_us, c->congested_us);
+
 	sysfs_strtoul(io_error_limit, c->error_limit);
 	if (attr == &sysfs_io_error_halflife) {
 		long halflife = 0;
@@ -7717,6 +7768,7 @@ static ssize_t store_cache_set_internal(struct kobject *kobj,
 	struct cache_set *c = container_of(kobj, struct cache_set, internal);
 	return __store_cache_set(c, attr, buffer, size);
 }
+
 /* Error handling stuff */
 
 static bool cache_set_error(struct cache_set *c, const char *m, ...)
@@ -7920,7 +7972,8 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	c->shrink.seeks = 3;
 	register_shrinker(&c->shrink);
 
-	c->error_limit = 8 << IO_ERROR_SHIFT;
+	c->congested_us	= 2000;
+	c->error_limit	= 8 << IO_ERROR_SHIFT;
 
 	return c;
 err:
@@ -8088,6 +8141,8 @@ static const char *register_cache_set(struct cache *ca)
 
 		&sysfs_io_error_limit,
 		&sysfs_io_error_halflife,
+		&sysfs_congested,
+		&sysfs_congested_threshold_us,
 		&sysfs_clear_stats,
 		NULL
 	};

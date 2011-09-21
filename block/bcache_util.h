@@ -414,9 +414,11 @@ static inline unsigned bio_max_sectors(struct bio *bio)
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
 extern unsigned latency_warn_ms;
 
+#define latency_ms(j)		jiffies_to_msecs(jiffies - (j))
+
 #define pr_latency(j, fmt, ...)						\
 do {									\
-	int _ms = jiffies_to_msecs(jiffies - (j));			\
+	int _ms = latency_ms(j);					\
 	if (j && latency_warn_ms && (_ms) > (int) latency_warn_ms)	\
 		printk_ratelimited(KERN_DEBUG "bcache: %i ms latency "	\
 			"called from %pf for " fmt "\n", _ms,		\
@@ -426,6 +428,7 @@ do {									\
 #define set_wait(f)	((f)->wait_time = jiffies)
 
 #else
+#define latency_ms(j)	(0)
 #define pr_latency(...) do {} while (0)
 #define set_wait(j)	do {} while (0)
 #endif

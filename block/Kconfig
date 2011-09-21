@@ -121,6 +121,7 @@ config BCACHE_EDEBUG
 config BCACHE_CLOSURE_DEBUG
 	bool "Debug bcache closures"
 	depends on BCACHE
+	select DEBUG_FS
 	---help---
 	Keeps all active closures in a linked list and provides a debugfs
 	interface to list them, which makes it possible to see asynchronous

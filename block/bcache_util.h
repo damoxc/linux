@@ -125,19 +125,23 @@ do {									\
 } while (0)
 
 #define heap_add(h, d, cmp)						\
-do {									\
-	size_t _i = (h)->used++;					\
-	(h)->data[_i]  = d;						\
+({									\
+	bool _r = !heap_full(h);					\
+	if (_r) {							\
+		size_t _i = (h)->used++;				\
+		(h)->data[_i]  = d;					\
 									\
-	heap_sift_down(h, _i, cmp);					\
-	heap_sift(h, _i, cmp);						\
-} while (0)
+		heap_sift_down(h, _i, cmp);				\
+		heap_sift(h, _i, cmp);					\
+	}								\
+	_r;								\
+})
 
 #define heap_pop(h, cmp)						\
 ({									\
 	typeof((h)->data[0]) _r = NULL;					\
 									\
-	if ((h)->size) {						\
+	if ((h)->used) {						\
 		_r = (h)->data[0];					\
 		(h)->used--;						\
 		heap_swap(h, 0, (h)->used);				\

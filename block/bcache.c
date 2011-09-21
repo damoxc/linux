@@ -947,13 +947,16 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 /* Btree key macros */
 
 #define KEY_FIELD(name, field, offset, size)				\
-	static inline uint64_t name(const struct bkey *k)		\
-	{ return (k->field >> offset) & ~(((uint64_t) ~0) << size); }	\
+	BITMASK(name, struct bkey, field, offset, size)
+
+#define PTR_FIELD(name, offset, size)					\
+	static inline uint64_t name(const struct bkey *k, unsigned i)	\
+	{ return (k->ptr[i] >> offset) & ~(((uint64_t) ~0) << size); }	\
 									\
-	static inline void SET_##name(struct bkey *k, uint64_t v)	\
+	static inline void SET_##name(struct bkey *k, unsigned i, uint64_t v)\
 	{								\
-		k->field &= ~(~((uint64_t) ~0 << size) << offset);	\
-		k->field |= v << offset;				\
+		k->ptr[i] &= ~(~((uint64_t) ~0 << size) << offset);	\
+		k->ptr[i] |= v << offset;				\
 	}
 
 /* All units are in sectors */
@@ -963,6 +966,10 @@ KEY_FIELD(KEY_SIZE,	header, 20, 16)
 KEY_FIELD(KEY_DEV,	header, 0,  20)
 KEY_FIELD(KEY_SECTOR,	key,	16, 47)
 KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
+
+PTR_FIELD(PTR_DEV,		51, 12)
+PTR_FIELD(PTR_OFFSET,		8,  43)
+PTR_FIELD(PTR_GEN,		0,  8)
 
 #define KEY_HEADER(len, dev)						\
 	(((uint64_t) 1 << 63) | ((uint64_t) (len) << 20) | dev)
@@ -981,9 +988,6 @@ KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
 #define PTR(gen, offset, dev)						\
 	((((uint64_t) dev) << 51) | ((uint64_t) offset) << 8 | gen)
 
-#define PTR_DEV(k, n)		((k)->ptr[n] >> 51)
-#define PTR_OFFSET(k, n)	(((k)->ptr[n] >> 8) & ~((int64_t) ~0 << 51))
-#define PTR_GEN(k, n)		((uint8_t) ((k)->ptr[n]) & 255)
 #define PTR_HASH(c, k)							\
 	(((k)->ptr[0] >> c->bucket_bits) | PTR_GEN(k, 0))
 
@@ -1495,7 +1499,7 @@ static bool __cut_front(const struct bkey *where, struct bkey *k)
 		bkey_copy_key(k, where);
 
 	for (unsigned i = 0; i < KEY_PTRS(k); i++)
-		k->ptr[i] += PTR(0, KEY_SIZE(k) - len, 0);
+		SET_PTR_OFFSET(k, i, PTR_OFFSET(k, i) + KEY_SIZE(k) - len);
 
 	BUG_ON(len > KEY_SIZE(k));
 	SET_KEY_SIZE(k, len);
@@ -1720,7 +1724,7 @@ static struct keyprint_hack _pkey(const struct bkey *k)
 			 KEY_DEV(k), k->key, KEY_SIZE(k));
 
 	if (KEY_PTRS(k))
-		i += scnprintf(r.s + i, 40 - i, "%llu gen %i",
+		i += scnprintf(r.s + i, 40 - i, "%llu gen %llu",
 			      PTR_OFFSET(k, 0), PTR_GEN(k, 0));
 	else
 		i += scnprintf(r.s + i, 40 - i, "[]");
@@ -3340,10 +3344,11 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 		 bio_sectors(ret), (uint64_t) ret->bi_sector,
 		 ret == bio ? 0 : bio_sectors(bio));
 
-	ret->bi_sector	= sector;
+	SET_PTR_OFFSET(op->keys.top, 0, sector);
+
 	ret->bi_end_io	= cache_read_endio;
 
-	__submit_bbio(ret, b->c, op->keys.top);
+	submit_bbio(ret, b->c, op->keys.top);
 	keylist_push(&op->keys);
 
 	return ret;
@@ -4261,8 +4266,7 @@ static int btree_split(struct btree *b, struct btree_op *op)
 		for (unsigned i = 0; i < KEY_PTRS(&b->key); i++) {
 			uint8_t g = PTR_BUCKET(b->c, &b->key, i)->gen + 1;
 
-			op->keys.top->ptr[i] -= PTR_GEN(op->keys.top, i);
-			op->keys.top->ptr[i] += g;
+			SET_PTR_GEN(op->keys.top, i, g);
 		}
 
 		keylist_push(&op->keys);
@@ -5498,7 +5502,7 @@ static void put_data_bucket(struct open_bucket *b, struct cache_set *c,
 	b->key.key += split;
 
 	bkey_copy(k, &b->key);
-	k->header += split << 20;
+	SET_KEY_SIZE(k, split);
 
 	b->sectors_free	-= split;
 
@@ -5515,7 +5519,7 @@ static void put_data_bucket(struct open_bucket *b, struct cache_set *c,
 		atomic_long_add(split,
 				&PTR_CACHE(c, &b->key, i)->sectors_written);
 
-		b->key.ptr[i] += PTR(0, split, 0);
+		SET_PTR_OFFSET(&b->key, i, PTR_OFFSET(&b->key, i) + split);
 	}
 
 	spin_unlock(&c->open_bucket_lock);

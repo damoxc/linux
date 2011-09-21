@@ -835,6 +835,7 @@ static uint16_t	initial_prio = 32768;
 
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
 unsigned latency_warn_ms;
+EXPORT_SYMBOL_GPL(latency_warn_ms);
 #endif
 
 static struct bcache_cgroup {

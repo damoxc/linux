@@ -346,6 +346,7 @@ EXPORT_SYMBOL_GPL(bio_submit_split);
 
 LIST_HEAD(closures);
 spinlock_t closure_lock;
+EXPORT_SYMBOL(closure_lock);
 
 #define SET_WAITING(s, f)	((s)->waiting_on = f)
 #else
@@ -477,8 +478,6 @@ EXPORT_SYMBOL_GPL(closure_sync);
 
 #ifdef CONFIG_BCACHE_CLOSURE_DEBUG
 
-#ifdef CONFIG_DEBUG_FS
-
 static struct dentry *debug;
 
 static int debug_seq_show(struct seq_file *f, void *data)
@@ -488,9 +487,9 @@ static int debug_seq_show(struct seq_file *f, void *data)
 	spin_lock_irq(&closure_lock);
 
 	list_for_each_entry(cl, &closures, all)
-		seq_printf(f, "%pf -> %p remaining %i waiting on %pf\n",
+		seq_printf(f, "%pf -> %p remaining %i waiting on %pf for %i ms\n",
 			   cl->fn, cl->parent, atomic_read(&cl->remaining),
-			   (void *) cl->waiting_on);
+			   (void *) cl->waiting_on, latency_ms(cl->wait_time));
 
 	spin_unlock_irq(&closure_lock);
 	return 0;
@@ -508,14 +507,6 @@ static const struct file_operations debug_ops = {
 	.release	= single_release
 };
 
-static void closure_debug_exit(void)
-{
-	debugfs_remove(debug);
-}
-module_exit(closure_debug_exit);
-
-#endif
-
 static int __init closure_debug_init(void)
 {
 	spin_lock_init(&closure_lock);
@@ -523,7 +514,13 @@ static int __init closure_debug_init(void)
 	return 0;
 }
 
+static void closure_debug_exit(void)
+{
+	debugfs_remove(debug);
+}
+
 module_init(closure_debug_init);
+module_exit(closure_debug_exit);
 
 #endif
 

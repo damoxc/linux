@@ -2147,14 +2147,14 @@ static void vdump_bucket_and_panic(struct btree *b, const char *m, va_list args)
 {
 	struct bset *i;
 
-	acquire_console_sem();
+	console_lock();
 
 	for_each_sorted_set(b, i)
 		dump_bset(b, i);
 
 	vprintk(m, args);
 
-	release_console_sem();
+	console_unlock();
 
 	panic("at %s\n", pbtree(b));
 }
@@ -5530,8 +5530,8 @@ static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
 	int pages = bio_get_nr_vecs(last_bio->bi_bdev) * PAGE_SECTORS;
 
 	if (sectors < 0 ||
-	    bio_rw_flagged(last_bio, BIO_RW_AHEAD) ||
-	    bio_rw_flagged(last_bio, BIO_RW_META) ||
+	    (last_bio->bi_rw & REQ_RAHEAD) ||
+	    (last_bio->bi_rw & REQ_META) ||
 	    s->op.d->c->gc_stats.in_use > CUTOFF_CACHE_READA)
 		sectors = 0;
 	else
@@ -7845,7 +7845,7 @@ static void free_cache(struct kobject *k)
 		put_page(c->sb_bio.bi_io_vec[0].bv_page);
 
 	if (!IS_ERR_OR_NULL(c->bdev))
-		close_bdev_exclusive(c->bdev, FMODE_READ|FMODE_WRITE);
+		blkdev_put(c->bdev, FMODE_READ|FMODE_WRITE);
 
 	module_put(THIS_MODULE);
 	kfree(c);
@@ -8032,7 +8032,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 		goto err;
 
 	err = "failed to open device";
-	bdev = open_bdev_exclusive(strim(path), FMODE_READ|FMODE_WRITE, sb);
+	bdev = blkdev_get_by_path(strim(path), FMODE_READ|FMODE_WRITE, sb);
 	if (bdev == ERR_PTR(-EBUSY))
 		err = "device busy";
 
@@ -8054,7 +8054,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	if (err) {
 		put_page(sb_page);
 err_close:
-		close_bdev_exclusive(bdev, FMODE_READ|FMODE_WRITE);
+		blkdev_put(bdev, FMODE_READ|FMODE_WRITE);
 err:
 		module_put(THIS_MODULE);
 		if (attr != &ksysfs_register_quiet)

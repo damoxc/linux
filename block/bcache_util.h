@@ -13,10 +13,24 @@
 #endif
 
 #ifndef REQ_WRITE
-#define REQ_WRITE	WRITE
-#define REQ_SYNC	(1U << BIO_RW_SYNCIO)
-#define REQ_UNPLUG	(1U << BIO_RW_UNPLUG)
-#define REQ_META	(1U << BIO_RW_META)
+
+#define REQ_WRITE		WRITE
+#define REQ_SYNC		(1U << BIO_RW_SYNCIO)
+#define REQ_UNPLUG		(1U << BIO_RW_UNPLUG)
+#define REQ_META		(1U << BIO_RW_META)
+#define REQ_RAHEAD		(1U << BIO_RW_AHEAD)
+
+#define console_lock()		acquire_console_sem()
+#define console_unlock()	release_console_sem()
+
+#define blkdev_put(...)		close_bdev_exclusive(__VA_ARGS__)
+#define blkdev_get_by_path(...)	open_bdev_exclusive(__VA_ARGS__)
+
+#else
+
+#define REQ_UNPLUG		0U
+#define DISCARD_NOBARRIER	REQ_DISCARD
+
 #endif
 
 extern struct workqueue_struct *system_wq;

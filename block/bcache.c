@@ -6074,7 +6074,7 @@ static void __request_read(struct closure *cl)
 	struct btree_op *op = container_of(cl, struct btree_op, cl);
 	struct search *s = container_of(op, struct search, op);
 	struct bio *bio = &s->bio.bio;
-	uint64_t reada = bio->bi_bdev->bd_inode->i_size;
+	uint64_t reada = bio->bi_bdev->bd_inode->i_size >> 9;
 
 	int ret = btree_root(search_recurse, op->d->c, op, s, &reada);
 

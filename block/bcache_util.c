@@ -174,7 +174,8 @@ void bio_map(struct bio *bio, void *base)
 
 	for (; size; bio->bi_vcnt++, bv++) {
 		bv->bv_offset	= 0;
-start:		bv->bv_len	= min(PAGE_SIZE - bv->bv_offset, size);
+start:		bv->bv_len	= min_t(size_t, PAGE_SIZE - bv->bv_offset,
+					size);
 		if (base) {
 			bv->bv_page = is_vmalloc_addr(base)
 				? vmalloc_to_page(base)

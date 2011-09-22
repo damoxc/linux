@@ -374,7 +374,8 @@ struct cache_set {
 	 * heap have their priority scaled down by a linear function.
 	 */
 	spinlock_t		bucket_lock;
-	unsigned		bucket_bits;
+	unsigned short		bucket_bits;
+	unsigned short		block_bits;
 	unsigned		btree_pages;
 
 	/* Refcount for when we can't write the priorities to disk until a
@@ -905,7 +906,7 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 #define btree_reserve(c)	((c->root ? c->root->level : 1) * 4 + 4)
 
 #define btree_bytes(c)		((c)->btree_pages * PAGE_SIZE)
-#define btree_blocks(b)		(KEY_SIZE(&b->key) / (b)->c->sb.block_size)
+#define btree_blocks(b)		(KEY_SIZE(&b->key) >> (b)->c->block_bits)
 
 #define bucket_pages(c)		((c)->sb.bucket_size / PAGE_SECTORS)
 #define bucket_bytes(c)		((c)->sb.bucket_size << 9)
@@ -915,7 +916,7 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 	((bucket_bytes(c) - sizeof(struct prio_set)) /	\
 	 sizeof(struct bucket_disk))
 #define prio_buckets(c)					\
-	DIV_ROUND_UP((c)->sb.nbuckets, prios_per_bucket(c))
+	DIV_ROUND_UP((size_t) (c)->sb.nbuckets, prios_per_bucket(c))
 
 #define JSET_MAGIC		0x245235c1a3625032
 #define PSET_MAGIC		0x6750e15f87337f91
@@ -925,8 +926,9 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 #define pset_magic(c)		((c)->sb.set_magic ^ PSET_MAGIC)
 #define bset_magic(c)		((c)->sb.set_magic ^ BSET_MAGIC)
 
-#define bucket_to_sector(c, b)	(((sector_t) (b)) << c->bucket_bits)
 #define sector_to_bucket(c, s)	((long) (s >> c->bucket_bits))
+#define bucket_to_sector(c, b)	(((sector_t) (b)) << c->bucket_bits)
+#define bucket_remainder(c, b)	((b) & ((c)->sb.bucket_size - 1))
 
 #define __set_bytes(i, k)	(sizeof(*(i)) + (k) * sizeof(uint64_t))
 #define set_bytes(i)		__set_bytes(i, i->keys)
@@ -2240,7 +2242,7 @@ static const char *ptr_status(struct cache_set *c, const struct bkey *k)
 	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
 		struct cache *ca = PTR_CACHE(c, k, i);
 		size_t bucket = PTR_BUCKET_NR(c, k, i);
-		size_t r = PTR_OFFSET(k, i) & ~(~0 << c->bucket_bits);
+		size_t r = bucket_remainder(c, PTR_OFFSET(k, i));
 
 		if (PTR_DEV(k, i) > MAX_CACHES_PER_SET)
 			return "bad cache device";
@@ -2277,7 +2279,7 @@ static bool __ptr_invalid(struct cache_set *c, int level, const struct bkey *k)
 	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
 		struct cache *ca = PTR_CACHE(c, k, i);
 		size_t bucket = PTR_BUCKET_NR(c, k, i);
-		size_t r = PTR_OFFSET(k, i) & ~(~0 << c->bucket_bits);
+		size_t r = bucket_remainder(c, PTR_OFFSET(k, i));
 
 		if (KEY_SIZE(k) + r > c->sb.bucket_size ||
 		    PTR_DEV(k, i) > MAX_CACHES_PER_SET)
@@ -4806,7 +4808,7 @@ static void btree_journal_alloc(struct cache_set *s)
 		free -= c->journal_start;
 
 		free = min_t(unsigned, free, c->sb.bucket_size -
-			     c->journal_start % c->sb.bucket_size);
+			     bucket_remainder(s, c->journal_start));
 		BUG_ON(!free);
 
 		s->journal.sectors_free = min(s->journal.sectors_free, free);
@@ -6487,9 +6489,9 @@ static ssize_t btree_fuzz(struct kobject *k, struct kobj_attribute *a,
 				: INSERT_READ;
 			k->key >>= 1;
 
-			k->header = KEY_HEADER(k->key % c->sb.bucket_size, 0);
-			k->key /= c->sb.bucket_size;
-			k->key %= 1024 * 512;
+			k->header = KEY_HEADER(bucket_remainder(c, k->key), 0);
+			k->key >>= c->bucket_bits;
+			k->key &= 1024 * 512 - 1;
 			k->key += c->sb.bucket_size;
 #if 0
 			SET_KEY_PTRS(k, 1);
@@ -6534,7 +6536,7 @@ static ssize_t btree_fuzz(struct kobject *k, struct kobj_attribute *a,
 			     k = next(k), j = next(j))
 				if (bkey_cmp(k, j) ||
 				    KEY_SIZE(k) != KEY_SIZE(j))
-					printk(KERN_ERR "key %li differs: %s "
+					printk(KERN_ERR "key %zi differs: %s "
 					       "!= %s\n", (uint64_t *) k - i->d,
 					       pkey(k), pkey(j));
 
@@ -7679,6 +7681,13 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 				 (c->gc_stats.nodes ?: 1) * btree_bytes(c));
 	}
 
+	unsigned average_key_size(struct cache_set *c)
+	{
+		return c->gc_stats.nkeys
+			? div64_u64(c->gc_stats.data, c->gc_stats.nkeys)
+			: 0;
+	}
+
 	sysfs_print(synchronous,		CACHE_SYNC(&c->sb));
 	sysfs_hprint(bucket_size,		bucket_bytes(c));
 	sysfs_hprint(block_size,		block_bytes(c));
@@ -7703,8 +7712,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 	sysfs_print(btree_used_percent,	btree_used(c));
 	sysfs_print(btree_nodes,	c->gc_stats.nodes);
 	sysfs_hprint(dirty_data,	c->gc_stats.dirty);
-	sysfs_hprint(average_key_size,	DIV_SAFE(c->gc_stats.data,
-						 c->gc_stats.nkeys));
+	sysfs_hprint(average_key_size,	average_key_size(c));
 
 	sysfs_print(writeback_keys_done,
 		    atomic_long_read(&c->writeback_keys_done));
@@ -7969,6 +7977,7 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	c->sb.nr_in_set		= sb->nr_in_set;
 	c->sb.last_mount	= sb->last_mount;
 	c->bucket_bits		= ilog2(sb->bucket_size);
+	c->block_bits		= ilog2(sb->block_size);
 	c->nr_uuids		= bucket_bytes(c) / sizeof(struct uuid_entry);
 
 	c->btree_pages		= c->sb.bucket_size / PAGE_SECTORS;
@@ -8127,7 +8136,7 @@ static void run_cache_set(struct cache_set *c)
 		mutex_lock(&c->gc_lock);
 
 		for_each_cache(ca, c) {
-			ca->sb.keys = clamp_t(int, ca->sb.nbuckets / 100,
+			ca->sb.keys = clamp_t(int, ca->sb.nbuckets >> 7,
 					      2, SB_JOURNAL_BUCKETS);
 
 			for (int i = 0; i < ca->sb.keys; i++)

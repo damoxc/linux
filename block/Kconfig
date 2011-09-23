@@ -111,11 +111,17 @@ config BCACHE
 config BCACHE_DEBUG
 	bool "Bcache debugging"
 	depends on BCACHE
+	---help---
+	Don't select this option unless you're a developer
+
+	Enables extra debugging tools (primarily a fuzz tester)
 
 config BCACHE_EDEBUG
 	bool "Extended runtime checks"
 	depends on BCACHE
 	---help---
+	Don't select this option unless you're a developer
+
 	Enables extra runtime checks which significantly affect performance
 
 config BCACHE_CLOSURE_DEBUG

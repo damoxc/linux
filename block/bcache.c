@@ -461,8 +461,8 @@ struct cache {
 
 	uint64_t		*prio_buckets;
 	uint64_t		*prio_next;
-	int			prio_write;
-	int			prio_alloc;
+	unsigned		prio_write;
+	unsigned		prio_alloc;
 
 	/* > 0: buckets in free_inc have been marked as free
 	 * = 0: buckets in free_inc can't be used until priorities are written
@@ -945,7 +945,7 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 	crc64(((void *) (i)) + 8, ((void *) end(i)) - (((void *) (i)) + 8))
 
 #define index(i, b)							\
-	((int) (((void *) i - (void *) (b)->data) / block_bytes(b->c)))
+	((size_t) (((void *) i - (void *) (b)->data) / block_bytes(b->c)))
 
 /* Btree key macros */
 
@@ -1491,7 +1491,7 @@ static void bkey_copy(struct bkey *dest, const struct bkey *src)
 
 static bool __cut_front(const struct bkey *where, struct bkey *k)
 {
-	int len = 0;
+	unsigned len = 0;
 
 	if (bkey_cmp(where, &START_KEY(k)) <= 0)
 		return false;
@@ -1517,7 +1517,7 @@ static bool cut_front(const struct bkey *where, struct bkey *k)
 
 static bool __cut_back(const struct bkey *where, struct bkey *k)
 {
-	int len = 0;
+	unsigned len = 0;
 
 	if (bkey_cmp(where, k) >= 0)
 		return false;
@@ -1699,7 +1699,7 @@ static void cache_endio(struct cache_set *c, struct bio *bio,
 		us = ktime_us_delta(t, b->time);
 		congested = atomic_read(&c->congested);
 
-		if (us > c->congested_us) {
+		if (us > (int) c->congested_us) {
 			int ms = us / 1024;
 			c->congested_last = t;
 
@@ -2154,10 +2154,10 @@ again:
 		struct bucket *b = c->buckets + r;
 #ifdef CONFIG_BCACHE_EDEBUG
 		long i;
-		for (i = 0; i < prio_buckets(c); i++)
-			BUG_ON(c->prio_buckets[i] == r);
-		for (i = 0; i < c->prio_alloc; i++)
-			BUG_ON(c->prio_next[i] == r);
+		for (unsigned j = 0; j < prio_buckets(c); j++)
+			BUG_ON(c->prio_buckets[j] == (uint64_t) r);
+		for (unsigned j = 0; j < c->prio_alloc; j++)
+			BUG_ON(c->prio_next[j] == (uint64_t) r);
 
 		fifo_for_each(i, &c->free)
 			BUG_ON(i == r);
@@ -2412,7 +2412,7 @@ static bool should_split(struct btree *b)
 static void dump_bset(struct btree *b, struct bset *i)
 {
 	for (struct bkey *k = i->start; k < end(i); k = next(k)) {
-		printk(KERN_ERR "block %i key %zu/%i: %s", index(i, b),
+		printk(KERN_ERR "block %zu key %zu/%i: %s", index(i, b),
 		       (uint64_t *) k - i->d, i->keys, pkey(k));
 
 		for (unsigned j = 0; j < KEY_PTRS(k); j++) {
@@ -2462,7 +2462,7 @@ dump_key_and_panic(struct btree *b, struct bset *i, int j)
 	long bucket = PTR_BUCKET_NR(b->c, node(i, j), 0);
 	long r = PTR_OFFSET(node(i, j), 0) & ~(~0 << b->c->bucket_bits);
 
-	printk(KERN_ERR "level %i block %i key %i/%i: %s "
+	printk(KERN_ERR "level %i block %zu key %i/%i: %s "
 	       "bucket %llu offset %li into bucket\n",
 	       b->level, index(i, b), j, i->keys, pkey(node(i, j)),
 	       (uint64_t) bucket, r);
@@ -3050,7 +3050,7 @@ static struct btree *alloc_bucket(struct cache_set *c, struct bkey *k,
 	}
 
 	struct btree *b, *i;
-	int pages = KEY_SIZE(k) / PAGE_SECTORS;
+	unsigned pages = KEY_SIZE(k) / PAGE_SECTORS;
 
 	lockdep_assert_held(&c->bucket_lock);
 	BUG_ON(list_empty(&c->lru));
@@ -4174,7 +4174,7 @@ copy:
 
 	while ((k = keylist_pop(&op->keys))) {
 		const char *status = "replacing";
-		int oldsize = count_data(b);
+		unsigned oldsize = count_data(b);
 
 		BUG_ON(b->level && !KEY_PTRS(k));
 		BUG_ON(!b->level && !k->key);
@@ -4211,7 +4211,7 @@ merged:
 		if (b->level && !k->key)
 			b->prio_blocked++;
 
-		pr_debug("%s for %s at %s block %i key %zu/%i: %s",
+		pr_debug("%s for %s at %s block %zu key %zu/%i: %s",
 			 status, insert_type(op), pbtree(b),
 			 index(i, b), m - i->start, i->keys, pkey(k));
 	}
@@ -5518,7 +5518,7 @@ static void put_data_bucket(struct open_bucket *b, struct cache_set *c,
 {
 	unsigned split = min(bio_sectors(bio), b->sectors_free);
 
-	for (int i = 0; i < KEY_PTRS(&b->key); i++)
+	for (unsigned i = 0; i < KEY_PTRS(&b->key); i++)
 		split = min(split, __bio_max_sectors(bio,
 				      PTR_CACHE(c, &b->key, i)->bdev,
 				      PTR_OFFSET(&b->key, i)));
@@ -6226,11 +6226,12 @@ skip:		s->cache_bio = s->orig_bio;
 
 #define sysfs_strtoul(file, var)					\
 	if (attr == &sysfs_ ## file)					\
-		return strtoul_safe(buffer, var) ?: size;
+		return strtoul_safe(buffer, var) ?: (ssize_t) size;
 
 #define sysfs_strtoul_clamp(file, var, min, max)			\
 	if (attr == &sysfs_ ## file)					\
-		return strtoul_safe_clamp(buffer, var, min, max) ?: size;
+		return strtoul_safe_clamp(buffer, var, min, max)	\
+			?: (ssize_t) size;
 
 #define strtoul_or_return(cp)						\
 ({									\
@@ -6243,7 +6244,7 @@ skip:		s->cache_bio = s->orig_bio;
 
 #define sysfs_hatoi(file, var)						\
 	if (attr == &sysfs_ ## file)					\
-		return strtoi_h(buffer, &var) ?: size;			\
+		return strtoi_h(buffer, &var) ?: (ssize_t) size;
 
 write_attribute(attach);
 write_attribute(detach);
@@ -6364,7 +6365,7 @@ static int btree_bset_stats(struct btree *b, struct btree_op *op,
 		stats->keys	+= b->sets[i]->keys * sizeof(uint64_t);
 		stats->floats	+= b->tree[i].size - 1;
 
-		for (int j = 1; j < b->tree[i].size; j++)
+		for (size_t j = 1; j < b->tree[i].size; j++)
 			if (b->tree[i].key[j].exponent == 127)
 				stats->failed++;
 	}
@@ -6689,7 +6690,7 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 		goto err;
 
 	err = "Journal buckets not sequential";
-	for (int i = 0; i < sb->keys; i++)
+	for (unsigned i = 0; i < sb->keys; i++)
 		if (sb->d[i] != sb->first_bucket + i)
 			goto err;
 
@@ -6856,7 +6857,7 @@ static void prio_write_done(struct closure *cl)
 
 	spin_lock(&c->set->bucket_lock);
 
-	for (int i = 0; i < prio_buckets(c); i++)
+	for (unsigned i = 0; i < prio_buckets(c); i++)
 		c->prio_buckets[i] = c->prio_next[i];
 
 	c->prio_alloc = 0;
@@ -7729,7 +7730,7 @@ static ssize_t __show_cache_set(struct cache_set *c, struct attribute *attr,
 
 	sysfs_print(gc_ms_max,		c->gc_stats.ms_max);
 	sysfs_print(seconds_since_gc,	!c->gc_stats.last ? -1 :
-		    get_seconds() - c->gc_stats.last);
+		    (long) (get_seconds() - c->gc_stats.last));
 
 	sysfs_print(btree_used_percent,	btree_used(c));
 	sysfs_print(btree_nodes,	c->gc_stats.nodes);
@@ -7829,7 +7830,7 @@ static ssize_t __store_cache_set(struct cache_set *c, struct attribute *attr,
 		ssize_t ret = strtoul_safe(io_error_halflife, halflife);
 		/* See count_io_errors for why 88 */
 		c->error_decay = halflife / 88;
-		return ret ?: size;
+		return ret ?: (ssize_t) size;
 	}
 
 	return size;

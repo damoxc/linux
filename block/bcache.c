@@ -470,6 +470,7 @@ struct cache {
 	 */
 	atomic_t		prio_written;
 	uint8_t			need_save_prio;
+	unsigned		invalidate_needs_gc:1;
 
 	DECLARE_FIFO(long, free);
 	DECLARE_FIFO(long, free_inc);
@@ -2025,6 +2026,13 @@ static void invalidate_buckets(struct cache *c)
 	struct bucket *b;
 	size_t pinned = 0, gc_gen = 0, disk_gen = 0;
 
+	/* free_some_buckets() may just need to write priorities to keep gens
+	 * from wrapping around
+	 */
+	if (!c->set->gc_mark_valid ||
+	    c->invalidate_needs_gc)
+		return;
+
 	c->heap.used = 0;
 
 	for_each_bucket(b, c) {
@@ -2059,8 +2067,16 @@ static void invalidate_buckets(struct cache *c)
 	for (ssize_t i = c->heap.used / 2 - 1; i >= 0; --i)
 		heap_sift(&c->heap, i, bucket_min_cmp);
 
-	while (!fifo_full(&c->free_inc) &&
-	       (b = heap_pop(&c->heap, bucket_min_cmp))) {
+	while (!fifo_full(&c->free_inc)) {
+		b = heap_pop(&c->heap, bucket_min_cmp);
+		if (!b) {
+			/* We don't want to be calling invalidate_buckets()
+			 * multiple times when it can't do anything
+			 */
+			c->invalidate_needs_gc = 1;
+			return;
+		}
+
 		inc_gen(c, b);
 		smp_mb();
 
@@ -2071,6 +2087,15 @@ static void invalidate_buckets(struct cache *c)
 		atomic_inc(&b->pin);
 		fifo_push(&c->free_inc, b - c->buckets);
 	}
+}
+
+static bool can_save_prios(struct cache *c)
+{
+	return ((c->need_save_prio > 64 ||
+		 (c->set->gc_mark_valid &&
+		  !c->invalidate_needs_gc)) &&
+		!atomic_read(&c->prio_written) &&
+		!atomic_read(&c->set->prio_blocked));
 }
 
 static void free_some_buckets(struct cache *c)
@@ -2107,9 +2132,7 @@ static void free_some_buckets(struct cache *c)
 	     c->need_save_prio > 64))
 		atomic_set(&c->prio_written, 0);
 
-	if (!c->set->gc_mark_valid ||
-	    atomic_read(&c->prio_written) ||
-	    atomic_read(&c->set->prio_blocked))
+	if (!can_save_prios(c))
 		return;
 
 	invalidate_buckets(c);
@@ -2164,9 +2187,7 @@ again:
 
 		closure_wait_on(&c->set->bucket_wait, delayed, cl,
 				atomic_read(&c->prio_written) > 0 ||
-				(c->set->gc_mark_valid &&
-				 !atomic_read(&c->set->prio_blocked) &&
-				 !atomic_read(&c->prio_written)));
+				can_save_prios(c));
 
 		if (test_bit(CLOSURE_BLOCK, &cl->flags)) {
 			spin_lock(&c->set->bucket_lock);
@@ -3886,6 +3907,8 @@ static size_t btree_gc_finish(struct cache_set *c)
 	mark_key(&c->uuid_bucket);
 
 	for_each_cache(ca, c) {
+		ca->invalidate_needs_gc = 0;
+
 		for (i = ca->sb.d; i < ca->sb.d + ca->sb.keys; i++)
 			ca->buckets[*i].mark = GC_MARK_BTREE;
 
@@ -4387,8 +4410,7 @@ static int __btree_insert_async(struct btree_op *op, struct cache_set *c)
 
 			closure_wait_on(&c->bucket_wait, delayed, &op->cl,
 					ca->need_save_prio <= MAX_SAVE_PRIO ||
-					(atomic_read(&ca->prio_written) >= 0 &&
-					 atomic_read(&c->prio_blocked) == 0));
+					can_save_prios(ca));
 		}
 
 	while (!keylist_empty(&stack_keys) ||

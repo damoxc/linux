@@ -2068,8 +2068,7 @@ static void invalidate_buckets(struct cache *c)
 		heap_sift(&c->heap, i, bucket_min_cmp);
 
 	while (!fifo_full(&c->free_inc)) {
-		b = heap_pop(&c->heap, bucket_min_cmp);
-		if (!b) {
+		if (!heap_pop(&c->heap, b, bucket_min_cmp)) {
 			/* We don't want to be calling invalidate_buckets()
 			 * multiple times when it can't do anything
 			 */
@@ -2526,10 +2525,10 @@ static void btree_bio_resubmit(struct work_struct *w)
 static void btree_bio_init(struct btree *b)
 {
 	bio_reset(&b->bio);
-	b->bio.bi_sector   = PTR_OFFSET(&b->key, 0) +
+	b->bio.bi_sector = PTR_OFFSET(&b->key, 0) +
 		b->written * b->c->sb.block_size;
-	b->bio.bi_bdev	   = PTR_CACHE(b->c, &b->key, 0)->bdev;
-	b->bio.bi_rw	   = REQ_META;
+	b->bio.bi_bdev	 = PTR_CACHE(b->c, &b->key, 0)->bdev;
+	b->bio.bi_rw	 = REQ_META;
 }
 
 static void fill_bucket_work(struct work_struct *w)
@@ -3705,9 +3704,9 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 		struct btree *n = btree_alloc(r->c, r->level, NULL);
 
 		if (!IS_ERR_OR_NULL(n)) {
+			btree_sort(r, 0, n->data);
+			bkey_copy_key(&n->key, &r->key);
 			swap(r, n);
-			btree_sort(n, 0, r->data);
-			bkey_copy_key(&r->key, &n->key);
 
 			memcpy(k->ptr, r->key.ptr,
 			       sizeof(uint64_t) * KEY_PTRS(&r->key));

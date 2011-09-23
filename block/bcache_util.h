@@ -129,7 +129,7 @@ do {									\
 	bool _r = !heap_full(h);					\
 	if (_r) {							\
 		size_t _i = (h)->used++;				\
-		(h)->data[_i]  = d;					\
+		(h)->data[_i] = d;					\
 									\
 		heap_sift_down(h, _i, cmp);				\
 		heap_sift(h, _i, cmp);					\
@@ -137,12 +137,11 @@ do {									\
 	_r;								\
 })
 
-#define heap_pop(h, cmp)						\
+#define heap_pop(h, d, cmp)						\
 ({									\
-	typeof((h)->data[0]) _r = NULL;					\
-									\
-	if ((h)->used) {						\
-		_r = (h)->data[0];					\
+	bool _r = (h)->used;						\
+	if (_r) {							\
+		(d) = (h)->data[0];					\
 		(h)->used--;						\
 		heap_swap(h, 0, (h)->used);				\
 		heap_sift(h, 0, cmp);					\

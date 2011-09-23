@@ -13,10 +13,9 @@ sequentially, then issues a discard before reusing it.
 
 Both writethrough and writeback caching are supported. Writeback defaults to
 off, but can be switched on and off arbitrarily at runtime. Bcache goes to
-great lengths to order all writes to the cache so that the cache is always in a
-consistent state on disk, and it never returns writes as completed until all
-necessary data and metadata writes are completed. It's designed to safely
-tolerate unclean shutdown without loss of data.
+great lengths to protect your data - it reliably handles unclean shutdown. (It
+doesn't even have a notion of a clean shutdown; bcache simply doesn't return
+writes as completed until they're on stable storage).
 
 Writeback caching can use most of the cache for buffering writes - writing
 dirty data to the backing device is always done sequentially, scanning from the
@@ -44,6 +43,12 @@ and backing device must be formatted before use.
 To make bcache devices known to the kernel, echo them to /sys/fs/bcache/register:
   echo /dev/sdb > /sys/fs/bcache/register
   echo /dev/sdc > /sys/fs/bcache/register
+
+To register your bcache devices automatically, you could add something like
+this to an init script:
+  echo /dev/sd* > /sys/fs/bcache/register_quiet
+
+It'll look for bcache superblocks and ignore everything that doesn't have one.
 
 When you register a backing device, you'll get a new /dev/bcache# device:
   mkfs.ext4 /dev/bcache0
@@ -248,18 +253,3 @@ For each cache within a cache set:
   written
     Sum of all data that has been written to the cache; comparison with
     btree_written gives the amount of write inflation in bcache.
-
-
-
-To script the UUID lookup, you could do something like:
-  echo "`blkid /dev/md1 -s UUID -o value` /dev/md1"\
-	  > /sys/kernel/config/bcache/register_dev
-
-Caveats:
-
-Bcache appears to be quite stable and reliable at this point, but there are a
-number of potential issues.
-
-The ordering requirement of barriers is silently ignored; for ext4 (and
-possibly other filesystems) you must explicitly mount with -o nobarrier or you
-risk severe filesystem corruption in the event of unclean shutdown.

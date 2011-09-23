@@ -1673,8 +1673,8 @@ static void count_io_errors(struct cache *c, int error, const char *m)
 		errors >>= IO_ERROR_SHIFT;
 
 		if (errors < c->set->error_limit)
-			printk(KERN_ERR "bcache: IO error on %s %s, recovering\n",
-			       bdevname(c->bdev, buf), m);
+			err_printk("IO error on %s %s, recovering\n",
+				   bdevname(c->bdev, buf), m);
 		else
 			cache_set_error(c->set, "too many IO errors", m);
 	}
@@ -2477,9 +2477,8 @@ static unsigned count_data(struct btree *b)
 	struct bkey *k;
 
 	if (!b->level)
-		for_each_key(b, k)
-			if (!ptr_invalid(b, k))
-				ret += KEY_SIZE(k);
+		for_each_key_filter(b, k, ptr_invalid)
+			ret += KEY_SIZE(k);
 	return ret;
 }
 
@@ -3302,7 +3301,6 @@ retry_alloc:
 		}
 	}
 
-
 	reset_bucket(b, level);
 	atomic_set(&b->nread, 1);
 	b->jiffies = jiffies;
@@ -3488,67 +3486,41 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 {
 	void do_fixups(void)
 	{
-		bool overlap(struct bkey *l, struct bkey *r)
-		{
-			return bkey_cmp(l, &START_KEY(r)) > 0;
-		}
+		struct btree_iter_set *top = iter->top, *i = top - 1;
+		struct bkey *k;
 
-		void cut_front_set(struct bkey *where, struct btree_iter_set *i)
-		{
-			struct bkey *k = i->k;
+		while (i >= iter->sets) {
+			if (top->k < i->k &&
+			    !bkey_cmp(&START_KEY(top->k), &START_KEY(i->k)))
+				swap(*top, *i);
 
-			do {
-				__cut_front(where, k);
-				k = next(k);
-			} while (k != i->end && overlap(where, k));
+			for (k = i->k;
+			     k != i->end && bkey_cmp(top->k, &START_KEY(k)) > 0;
+			     k = next(k))
+				if (top->k > i->k)
+					__cut_front(top->k, k);
+				else if (KEY_SIZE(k))
+					cut_back(&START_KEY(k), top->k);
+
+			if (top->k < i->k || k == i->k)
+				break;
 
 			__btree_iter_bubble(iter, i);
 		}
-
-		struct btree_iter_set *top = iter->top, *i = top - 1;
-
-		if (iter->top <= iter->sets)
-			return;
-
-		while (bkey_cmp(&START_KEY(top->k), &START_KEY(i->k)) == 0) {
-			if (top->k < i->k)
-				swap(*top, *i);
-
-			if (!KEY_SIZE(top->k))
-				return;
-
-			cut_front_set(top->k, i);
-		}
-
-		while (i >= iter->sets && overlap(top->k, i->k)) {
-			if (top->k < i->k) {
-				struct bkey *k = i->k;
-
-				do {
-					if (KEY_SIZE(k))
-						cut_back(&START_KEY(k), top->k);
-
-					k = next(k);
-				} while (k != i->end && overlap(top->k, k));
-
-				--i;
-			} else
-				cut_front_set(top->k, i);
-		}
-	}
-
-	bool bad(struct bkey *k)
-	{
-		return b->written && !new
-			? ptr_invalid(b, k)
-			: ptr_bad(b, k);
 	}
 
 	size_t oldsize = 0, order = b->page_order, keys = 0;
 	struct bset *out = new;
 	struct bkey *k, *last = NULL;
+	bool remove_stale = new || !b->written;
 
-	if (!fixup)
+	bool (*bad)(struct btree *, const struct bkey *) = remove_stale
+		? ptr_bad
+		: ptr_invalid;
+
+	BUG_ON(remove_stale && fixup);
+
+	if (!fixup && !remove_stale)
 		oldsize = count_data(b);
 
 	if (start) {
@@ -3574,14 +3546,15 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 			do_fixups();
 
 		k = btree_iter_next(iter);
+		if (bad(b, k))
+			continue;
 
-		if (!bad(k)) {
-			if (!last)
-				last = out->start;
-			else if (b->level ||
-				 !btree_try_merge(b, last, k))
-				last = next(last);
-
+		if (!last) {
+			last = out->start;
+			bkey_copy(last, k);
+		} else if (b->level ||
+			   !btree_try_merge(b, last, k)) {
+			last = next(last);
 			bkey_copy(last, k);
 		}
 	}
@@ -3616,7 +3589,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 
 	pr_debug("sorted %i keys", b->sets[start]->keys);
 	check_key_order(b, b->sets[start]);
-	BUG_ON(!fixup && b->written && count_data(b) < oldsize);
+	BUG_ON(!fixup && !remove_stale && count_data(b) < oldsize);
 }
 
 static void btree_sort(struct btree *b, int start, struct bset *new)
@@ -4705,9 +4678,9 @@ static int btree_journal_replay(struct cache_set *s, struct list_head *list,
 		last++;
 		BUG_ON(last > i->j.seq);
 		if (last != i->j.seq)
-			printk(KERN_ERR "bcache: journal entries %llu-%llu "
-			       "missing! (replaying %llu-%llu)\n",
-			       last, i->j.seq, start, end);
+			err_printk("journal entries %llu-%llu "
+				   "missing! (replaying %llu-%llu)\n",
+				   last, i->j.seq, start, end);
 
 		for (struct bkey *k = i->j.start; k < end(&i->j); k = next(k)) {
 			pr_debug("%s", pkey(k));
@@ -7876,7 +7849,7 @@ static bool cache_set_error(struct cache_set *c, const char *m, ...)
 	acquire_console_sem();
 	*/
 
-	printk(KERN_ERR "bcache error on %pU: ", c->sb.set_uuid);
+	printk(KERN_ERR "bcache: error on %pU: ", c->sb.set_uuid);
 
 	va_start(args, m);
 	vprintk(m, args);

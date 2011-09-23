@@ -84,7 +84,7 @@ EXPORT_SYMBOL_GPL(hprint);
 
 bool is_zero(const char *p, size_t n)
 {
-	for (int i = 0; i < n; i++)
+	for (size_t i = 0; i < n; i++)
 		if (p[i])
 			return false;
 	return true;
@@ -93,7 +93,7 @@ EXPORT_SYMBOL_GPL(is_zero);
 
 int parse_uuid(const char *s, char *uuid)
 {
-	int i, j, x;
+	size_t i, j, x;
 	memset(uuid, 0, 16);
 
 	for (i = 0, j = 0;
@@ -209,7 +209,7 @@ EXPORT_SYMBOL_GPL(bio_alloc_pages);
 struct bio *bio_split_front(struct bio *bio, int sectors, bio_alloc_fn *_alloc,
 			    gfp_t gfp, struct bio_set *bs)
 {
-	int idx, vcnt = 0, nbytes = sectors << 9;
+	unsigned idx, vcnt = 0, nbytes = sectors << 9;
 	struct bio_vec *bv;
 	struct bio *ret = NULL;
 
@@ -282,7 +282,7 @@ struct bio *bio_split_front(struct bio *bio, int sectors, bio_alloc_fn *_alloc,
 EXPORT_SYMBOL_GPL(bio_split_front);
 
 unsigned __bio_max_sectors(struct bio *bio, struct block_device *bdev,
-		      sector_t sector)
+			   sector_t sector)
 {
 	unsigned ret = bio_sectors(bio);
 	struct request_queue *q = bdev_get_queue(bdev);
@@ -302,7 +302,7 @@ unsigned __bio_max_sectors(struct bio *bio, struct block_device *bdev,
 
 		for (struct bio_vec *bv = bio_iovec(bio); bv < end; bv++) {
 			if (q->merge_bvec_fn &&
-			    q->merge_bvec_fn(q, &bvm, bv) < bv->bv_len)
+			    q->merge_bvec_fn(q, &bvm, bv) < (int) bv->bv_len)
 				break;
 
 			ret		+= bv->bv_len >> 9;

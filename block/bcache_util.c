@@ -58,7 +58,7 @@ int name ## _h(const char *cp, type *res)		        \
 								\
 	*res = i;						\
 	return 0;						\
-}                                                               \
+}								\
 EXPORT_SYMBOL_GPL(name ## _h);
 
 STRTO_H(strtol, long)
@@ -488,7 +488,8 @@ static int debug_seq_show(struct seq_file *f, void *data)
 	spin_lock_irq(&closure_lock);
 
 	list_for_each_entry(cl, &closures, all)
-		seq_printf(f, "%pf -> %p remaining %i waiting on %pf for %i ms\n",
+		seq_printf(f, "%pf -> %p remaining %i "
+			   "waiting on %pf for %i ms\n",
 			   cl->fn, cl->parent, atomic_read(&cl->remaining),
 			   (void *) cl->waiting_on, latency_ms(cl->wait_time));
 

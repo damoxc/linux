@@ -4487,19 +4487,19 @@ reread:		left = ca->sb.bucket_size - offset;
 		j = data;
 		while (len) {
 			struct list_head *where;
-			size_t blocks = 1, bytes = set_bytes(j);
+			size_t blocks, bytes = set_bytes(j);
 
 			if (j->magic != jset_magic(ca->set))
-				goto next_set;
+				return ret;
 
 			if (bytes > left << 9)
-				goto next_set;
+				return ret;
 
 			if (bytes > len << 9)
 				goto reread;
 
 			if (j->csum != csum_set(j))
-				goto next_set;
+				return ret;
 
 			blocks = set_blocks(j, ca->set);
 

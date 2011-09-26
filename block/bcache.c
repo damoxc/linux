@@ -5945,18 +5945,19 @@ static struct search *do_bio_hook(struct bio *bio, struct cached_dev *d)
 	return s;
 }
 
-static void do_readahead(struct search *s, struct bio *last_bio, int sectors)
+static void do_readahead(struct search *s, struct bio *last_bio, sector_t reada)
 {
 	struct bio *bio = NULL;
-	int pages = bio_get_nr_vecs(last_bio->bi_bdev) * PAGE_SECTORS;
+	unsigned pages, sectors = 0;
 
-	if (sectors < 0 ||
-	    (last_bio->bi_rw & REQ_RAHEAD) ||
-	    (last_bio->bi_rw & REQ_META) ||
-	    s->op.d->c->gc_stats.in_use > CUTOFF_CACHE_READA)
-		sectors = 0;
-	else
-		sectors = min(sectors, pages);
+	if (reada > bio_end(last_bio) &&
+	    !(last_bio->bi_rw & REQ_RAHEAD) &&
+	    !(last_bio->bi_rw & REQ_META) &&
+	    s->op.d->c->gc_stats.in_use < CUTOFF_CACHE_READA)
+		sectors = min_t(unsigned, reada - bio_end(last_bio),
+				__bio_max_sectors(last_bio,
+						  last_bio->bi_bdev,
+						  bio_end(last_bio)));
 
 	pages = DIV_ROUND_UP(sectors, PAGE_SECTORS);
 	s->cache_bio = bbio_kmalloc(GFP_NOIO, last_bio->bi_max_vecs + pages);
@@ -6050,10 +6051,20 @@ insert:
 			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
 
 		closure_get(&s->cl);
-		generic_make_request(&s->bio.bio);
+		closure_bio_submit(&s->bio.bio, &s->cl, s->op.d->c->bio_split);
 	}
 
 	return_f(cl, bio_complete);
+}
+
+static void request_resubmit(struct closure *cl)
+{
+	struct btree_op *op = container_of(cl, struct btree_op, cl);
+	struct search *s = container_of(op, struct search, op);
+	struct bio *bio = &s->bio.bio;
+
+	closure_bio_submit(bio, &s->cl, op->d->c->bio_split);
+	return_f(cl, NULL);
 }
 
 static void __request_read(struct closure *cl)
@@ -6079,12 +6090,14 @@ static void __request_read(struct closure *cl)
 		reada = min_t(uint64_t, reada,
 			      bio->bi_sector + (op->d->readahead >> 9));
 
-		do_readahead(s, bio, reada - bio_end(bio));
+		do_readahead(s, bio, reada);
 	}
 
 	if (!s->cache_hit) {
 		s->cache_miss = true;
-		generic_make_request(bio);
+
+		if (closure_bio_submit(bio, &s->cl, op->d->c->bio_split))
+			return_f(cl, request_resubmit);
 	}
 
 	atomic_inc(&op->d->stats[s->skip][s->cache_miss]);
@@ -6114,6 +6127,16 @@ static bool should_writeback(struct cached_dev *d, struct bio *bio)
 		: CUTOFF_WRITEBACK;
 }
 
+static void request_write_resubmit(struct closure *cl)
+{
+	struct btree_op *op = container_of(cl, struct btree_op, cl);
+	struct search *s = container_of(op, struct search, op);
+	struct bio *bio = &s->bio.bio;
+
+	closure_bio_submit(bio, &s->cl, op->d->c->bio_split);
+	bio_insert(&s->op.cl);
+}
+
 static void request_write(struct search *s)
 {
 	struct bio *bio = &s->bio.bio;
@@ -6132,8 +6155,10 @@ skip:		s->cache_bio = s->orig_bio;
 		bio_get(s->cache_bio);
 
 		bio_invalidate(s);
+		if (closure_bio_submit(bio, &s->cl, s->op.d->c->bio_split))
+			return_f(&s->op.cl, request_resubmit);
+
 		closure_put(&s->op.cl, delayed);
-		generic_make_request(bio);
 		return;
 	}
 
@@ -6148,13 +6173,14 @@ skip:		s->cache_bio = s->orig_bio;
 		}
 
 		__bio_clone(s->cache_bio, bio);
-		bio_insert(&s->op.cl);
-		generic_make_request(bio);
+		if (closure_bio_submit(bio, &s->cl, s->op.d->c->bio_split))
+			return_f(&s->op.cl, request_write_resubmit);
 	} else {
 		s->cache_bio = bio;
 		closure_put(&s->cl, delayed);
-		bio_insert(&s->op.cl);
 	}
+
+	bio_insert(&s->op.cl);
 }
 
 /* Sysfs */

@@ -1602,18 +1602,17 @@ static struct bio *bio_split_get(struct bio *bio, int len, struct cache_set *c)
 	return ret;
 }
 
-static void __submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
+static void __submit_bbio(struct bio *bio, struct cache_set *c)
 {
 	struct bbio *b = container_of(bio, struct bbio, bio);
 
 	BUG_ON(bio->bi_destructor &&
 	       (bio->bi_destructor != bbio_destructor) &&
 	       (bio->bi_destructor != (void *) c->bio_split));
-	BUG_ON(KEY_PTRS(k) != 1);
+	BUG_ON(KEY_PTRS(&b->key) != 1);
 
-	bkey_copy(&b->key, k);
-
-	bio->bi_bdev	= PTR_CACHE(c, k, 0)->bdev;
+	bio->bi_sector	= PTR_OFFSET(&b->key, 0);
+	bio->bi_bdev	= PTR_CACHE(c, &b->key, 0)->bdev;
 	b->time		= ktime_get();
 
 	generic_make_request(bio);
@@ -1621,9 +1620,10 @@ static void __submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
 
 static void submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
 {
-	bio->bi_sector = PTR_OFFSET(k, 0);
+	struct bbio *b = container_of(bio, struct bbio, bio);
+	bkey_copy(&b->key, k);
 
-	__submit_bbio(bio, c, k);
+	__submit_bbio(bio, c);
 }
 
 /* IO errors */
@@ -1673,9 +1673,10 @@ static void count_io_errors(struct cache *c, int error, const char *m)
 	}
 }
 
-static void count_bio_errors(struct cache_set *c, struct bio *bio,
-			     int error, const char *m)
+static void cache_endio(struct cache_set *c, struct bio *bio,
+			int error, const char *m)
 {
+	struct closure *cl = bio->bi_private;
 	struct bbio *b = container_of(bio, struct bbio, bio);
 	struct cache *ca = PTR_CACHE(c, &b->key, 0);
 
@@ -1702,6 +1703,8 @@ static void count_bio_errors(struct cache_set *c, struct bio *bio,
 	}
 
 	count_io_errors(ca, error, m);
+	bio_put(bio);
+	closure_put(cl, delayed);
 }
 
 /* Btree/bkey debug printing */
@@ -5576,8 +5579,6 @@ static void bio_insert_endio(struct bio *bio, int error)
 	struct btree_op *op = container_of(cl, struct btree_op, cl);
 	struct search *s = container_of(op, struct search, op);
 
-	count_bio_errors(op->d->c, bio, error, "writing data to cache");
-
 	if (error) {
 		/* TODO: We could try to recover from this. */
 		if (op->insert_type == INSERT_WRITEBACK)
@@ -5601,8 +5602,7 @@ static void bio_insert_endio(struct bio *bio, int error)
 			cl->fn = NULL;
 	}
 
-	bio_put(bio);
-	closure_put(cl, delayed);
+	cache_endio(op->d->c, bio, error, "writing data to cache");
 }
 
 static void bio_insert(struct closure *cl)
@@ -5663,6 +5663,9 @@ static void bio_insert(struct closure *cl)
 err:
 	switch (op->insert_type) {
 	case INSERT_WRITEBACK:
+		/* This is dead code now, since we handle all memory allocation
+		 * failures and block if we don't have free buckets
+		 */
 		BUG();
 		/* Lookup in in_writeback rb tree, wait on appropriate
 		 * closure, then invalidate in btree and do normal
@@ -5778,12 +5781,10 @@ static void cache_read_endio(struct bio *bio, int error)
 	struct closure *cl = bio->bi_private;
 	struct search *s = container_of(cl, struct search, cl);
 
-	count_bio_errors(s->op.d->c, bio, error, "reading from cache");
-
 	if (error)
 		s->error = error;
 
-	request_endio(bio, 0);
+	cache_endio(s->op.d->c, bio, error, "reading from cache");
 }
 
 static void readahead_endio(struct bio *bio, int error)

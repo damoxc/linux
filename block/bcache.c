@@ -1396,55 +1396,43 @@ bsearch:
 /* Btree iterator */
 
 struct btree_iter {
+	size_t size, used;
 	struct btree_iter_set {
 		struct bkey *k, *end;
-	} *top, sets[8];
+	} data[8];
 };
 
 static bool btree_iter_end(struct btree_iter *iter)
 {
-	return iter->top < iter->sets;
+	return !iter->used;
 }
 
-static void __btree_iter_bubble(struct btree_iter *iter,
-				struct btree_iter_set *start)
+static bool btree_iter_cmp(struct btree_iter_set l, struct btree_iter_set r)
 {
-	int64_t cmp(struct bkey *l, struct bkey *r)
-	{
-		return bkey_cmp(&START_KEY(l), &START_KEY(r));
-	}
-
-	for (struct btree_iter_set *i = start - 1;
-	     i >= iter->sets && cmp(i[1].k, i[0].k) > 0;
-	     --i)
-		swap(i[1], i[0]);
+	return bkey_cmp(&START_KEY(l.k), &START_KEY(r.k)) > 0;
 }
 
-#define btree_iter_bubble(iter)		__btree_iter_bubble(iter, (iter)->top)
-
-static void btree_iter_push(struct btree_iter *iter)
+static void btree_iter_push(struct btree_iter *iter,
+			    struct bkey *k, struct bkey *end)
 {
-	if (iter->top->k != iter->top->end) {
-		btree_iter_bubble(iter);
-		iter->top++;
-	}
+	if (k != end)
+		BUG_ON(!heap_add(iter,
+				 ((struct btree_iter_set) { k, end }),
+				 btree_iter_cmp));
 }
 
 static struct bkey *__btree_iter_init(struct btree *b, struct btree_iter *iter,
 				      struct bkey *search, int start)
 {
 	struct bkey *ret = NULL;
-	iter->top = iter->sets;
+	iter->size = 8;
+	iter->used = 0;
 
 	for (int i = start; i <= b->nsets; i++) {
-		iter->top->k	= bset_search(b, i, search);
-		iter->top->end	= end(b->sets[i]);
-		ret = iter->top->k;
-
-		btree_iter_push(iter);
+		ret = bset_search(b, i, search);
+		btree_iter_push(iter, ret, end(b->sets[i]));
 	}
 
-	iter->top--;
 	return ret;
 }
 
@@ -1453,21 +1441,22 @@ static struct bkey *__btree_iter_init(struct btree *b, struct btree_iter *iter,
 
 static struct bkey *btree_iter_next(struct btree_iter *iter)
 {
+	struct btree_iter_set unused;
 	struct bkey *ret = NULL;
 
 	if (!btree_iter_end(iter)) {
-		ret = iter->top->k;
-		iter->top->k = next(iter->top->k);
+		ret = iter->data->k;
+		iter->data->k = next(iter->data->k);
 
-		if (iter->top->k > iter->top->end) {
+		if (iter->data->k > iter->data->end) {
 			__WARN();
-			iter->top->k = iter->top->end;
+			iter->data->k = iter->data->end;
 		}
 
-		if (iter->top->k == iter->top->end)
-			iter->top--;
-
-		btree_iter_bubble(iter);
+		if (iter->data->k == iter->data->end)
+			heap_pop(iter, unused, btree_iter_cmp);
+		else
+			heap_sift(iter, 0, btree_iter_cmp);
 	}
 
 	return ret;
@@ -2540,7 +2529,7 @@ static void fill_bucket_work(struct work_struct *w)
 	BUG_ON(b->nsets || b->written);
 
 	mutex_lock(&b->c->fill_lock);
-	iter->top = iter->sets;
+	iter->used = 0;
 
 	if (!b->data->seq)
 		goto err;
@@ -2580,9 +2569,7 @@ static void fill_bucket_work(struct work_struct *w)
 		if (i->keys && bkey_cmp(&b->key, last_key(i)) < 0)
 			goto err;
 
-		iter->top->k	= i->start;
-		iter->top->end	= end(i);
-		btree_iter_push(iter);
+		btree_iter_push(iter, i->start, end(i));
 
 		b->written += set_blocks(i, b->c);
 	}
@@ -2594,8 +2581,7 @@ static void fill_bucket_work(struct work_struct *w)
 		if (i->seq == b->data->seq)
 			goto err;
 
-	iter->top--;
-	__btree_sort(b, 0, NULL, iter, !b->level);
+	__btree_sort(b, 0, NULL, iter, true);
 
 	pr_latency(b->expires, "fill_bucket");
 
@@ -3480,34 +3466,40 @@ static bool btree_try_merge(struct btree *b, struct bkey *l, struct bkey *r)
 	return true;
 }
 
+static void btree_sort_fixup(struct btree_iter *iter)
+{
+	while (iter->used > 1) {
+		struct btree_iter_set *top = iter->data, *i = top + 1;
+		struct bkey *k;
+
+		if (iter->used > 2 &&
+		    (bkey_cmp(&START_KEY(i[0].k), &START_KEY(i[1].k)) > 0 ||
+		     (i[0].k < i[1].k &&
+		      !bkey_cmp(&START_KEY(i[0].k), &START_KEY(i[1].k)))))
+			i++;
+
+		if (top->k < i->k &&
+		    !bkey_cmp(&START_KEY(top->k), &START_KEY(i->k)))
+			swap(*top, *i);
+
+		for (k = i->k;
+		     k != i->end && bkey_cmp(top->k, &START_KEY(k)) > 0;
+		     k = next(k))
+			if (top->k > i->k)
+				__cut_front(top->k, k);
+			else if (KEY_SIZE(k))
+				cut_back(&START_KEY(k), top->k);
+
+		if (top->k < i->k || k == i->k)
+			break;
+
+		heap_sift(iter, i - top, btree_iter_cmp);
+	}
+}
+
 static void __btree_sort(struct btree *b, int start, struct bset *new,
 			 struct btree_iter *iter, bool fixup)
 {
-	void do_fixups(void)
-	{
-		struct btree_iter_set *top = iter->top, *i = top - 1;
-		struct bkey *k;
-
-		while (i >= iter->sets) {
-			if (top->k < i->k &&
-			    !bkey_cmp(&START_KEY(top->k), &START_KEY(i->k)))
-				swap(*top, *i);
-
-			for (k = i->k;
-			     k != i->end && bkey_cmp(top->k, &START_KEY(k)) > 0;
-			     k = next(k))
-				if (top->k > i->k)
-					__cut_front(top->k, k);
-				else if (KEY_SIZE(k))
-					cut_back(&START_KEY(k), top->k);
-
-			if (top->k < i->k || k == i->k)
-				break;
-
-			__btree_iter_bubble(iter, i);
-		}
-	}
-
 	size_t oldsize = 0, order = b->page_order, keys = 0;
 	struct bset *out = new;
 	struct bkey *k, *last = NULL;
@@ -3518,6 +3510,9 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 		: ptr_invalid;
 
 	BUG_ON(remove_stale && fixup);
+
+	if (b->level)
+		fixup = false;
 
 	if (!fixup && !remove_stale)
 		oldsize = count_data(b);
@@ -3542,7 +3537,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 
 	while (!btree_iter_end(iter)) {
 		if (fixup)
-			do_fixups();
+			btree_sort_fixup(iter);
 
 		k = btree_iter_next(iter);
 		if (bad(b, k))
@@ -8012,6 +8007,8 @@ static struct cache_set *alloc_cache_set(struct cache_sb *sb)
 	    !(c->journal.w[1].data = (void *) __get_free_pages(GFP_KERNEL,
 							       JSET_BITS)))
 		goto err;
+
+	c->fill_iter->size = sb->bucket_size / sb->block_size;
 
 	for (int i = 0; i < 16; i++) {
 		struct open_bucket *b = kzalloc(sizeof(*b), GFP_KERNEL);

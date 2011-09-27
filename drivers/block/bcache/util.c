@@ -5,7 +5,7 @@
 #include <linux/seq_file.h>
 #include <linux/types.h>
 #include <linux/ratelimit.h>
-#include "bcache_util.h"
+#include "util.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kent Overstreet <kent.overstreet@gmail.com>");

@@ -640,6 +640,8 @@ struct cached_dev {
 	unsigned long		sequential_cutoff;
 	unsigned		sequential_merge:1;
 
+	unsigned		data_csum:1;
+
 	unsigned		writeback:1;
 	unsigned		writeback_metadata:1;
 	unsigned		writeback_running:1;
@@ -964,9 +966,14 @@ static bool cache_set_error(struct cache_set *, const char *, ...);
 
 /* All units are in sectors */
 KEY_FIELD(KEY_PTRS,	header, 60, 3)
+KEY_FIELD(HEADER_SIZE,	header, 58, 2)
+KEY_FIELD(KEY_CSUM,	header, 56, 2)
+KEY_FIELD(KEY_PINNED,	header, 55, 1)
 KEY_FIELD(KEY_DIRTY,	header, 36, 1)
+
 KEY_FIELD(KEY_SIZE,	header, 20, 16)
 KEY_FIELD(KEY_DEV,	header, 0,  20)
+
 KEY_FIELD(KEY_SECTOR,	key,	16, 47)
 KEY_FIELD(KEY_SNAPSHOT,	key,	0,  16)
 
@@ -1114,9 +1121,17 @@ static inline void __rw_unlock(bool w, struct btree *b, bool nowrite)
 
 /* Btree key comparison/iteration */
 
+__pure
+static inline size_t key_u64s(const struct bkey *k)
+{
+	BUG_ON(KEY_CSUM(k) > 1);
+	return 2 + KEY_PTRS(k) + (KEY_CSUM(k) ? 1 : 0);
+}
+
+__pure
 static inline size_t key_bytes(const struct bkey *k)
 {
-	return (2 + KEY_PTRS(k)) * sizeof(uint64_t);
+	return key_u64s(k) * sizeof(uint64_t);
 }
 
 static int64_t bkey_cmp(const struct bkey *l, const struct bkey *r)
@@ -1129,7 +1144,7 @@ __pure
 static struct bkey *next(const struct bkey *k)
 {
 	uint64_t *d = (void *) k;
-	return (struct bkey *) (d + 2 + KEY_PTRS(k));
+	return (struct bkey *) (d + key_u64s(k));
 }
 
 __pure
@@ -1152,7 +1167,7 @@ static unsigned bset_middle(struct bset *i, unsigned l, unsigned r)
 		m--;
 
 	if (m == l && next(node(i, m)) != node(i, r))
-		m += 2 + KEY_PTRS(node(i, m));
+		m += key_u64s(node(i, m));
 
 	return m;
 }
@@ -1169,7 +1184,7 @@ static struct bkey *bset_bsearch(struct bset *i, const struct bkey *search,
 		if (bkey_cmp(node(i, m), search) > 0)
 			r = m;
 		else
-			l = m + 2 + KEY_PTRS(node(i, m));
+			l = m + key_u64s(node(i, m));
 	}
 
 	return node(i, l);
@@ -1462,6 +1477,29 @@ static struct bkey *btree_iter_next(struct btree_iter *iter)
 	return ret;
 }
 
+/* Checksumming algorithm */
+
+static void bio_csum(struct bio *bio, struct bkey *k)
+{
+	struct bio_vec *bv;
+	uint64_t csum = 0;
+	int i;
+
+	bio_for_each_segment(bv, bio, i) {
+		void *d = kmap(bv->bv_page) + bv->bv_offset;
+		csum = crc64_update(csum, d, bv->bv_len);
+		kunmap(bv->bv_page);
+	}
+
+	k->ptr[KEY_PTRS(k)] = csum & (~0ULL >> 1);
+}
+
+uint64_t merge_chksums(struct bkey *l, struct bkey *r)
+{
+	return (l->ptr[KEY_PTRS(l)] + r->ptr[KEY_PTRS(r)]) &
+		~((uint64_t)1 << 63);
+}
+
 /* Btree key manipulation */
 
 static void bkey_copy_key(struct bkey *dest, const struct bkey *src)
@@ -1476,6 +1514,55 @@ static void bkey_copy_key(struct bkey *dest, const struct bkey *src)
 static void bkey_copy(struct bkey *dest, const struct bkey *src)
 {
 	memcpy(dest, src, key_bytes(src));
+}
+
+static void bkey_copy_single_ptr(struct bkey *dest,
+				 const struct bkey *src,
+				 unsigned i)
+{
+	BUG_ON(i > KEY_PTRS(src));
+
+	/* Only copy the header, key, and one pointer. */
+	memcpy(dest, src, 2 * sizeof(uint64_t));
+	dest->ptr[0] = src->ptr[i];
+	SET_KEY_PTRS(dest, 1);
+	/* We didn't copy the checksum so clear that bit. */
+	SET_KEY_CSUM(dest, 0);
+}
+
+/* Tries to merge l and r: l should be lower than r
+ * Returns true if we were able to merge. If we did merge, l will be the merged
+ * key, r will be untouched.
+ */
+static bool bkey_try_merge(struct btree *b, struct bkey *l, struct bkey *r)
+{
+	if (KEY_PTRS(l) != KEY_PTRS(r) ||
+	    KEY_DIRTY(l) != KEY_DIRTY(r) ||
+	    bkey_cmp(l, &START_KEY(r)))
+		return false;
+
+	/* Keys with no pointers aren't restricted to one bucket, and buckets
+	 * could be bigger max key size:
+	 */
+	if (KEY_SIZE(l) + KEY_SIZE(r) > USHRT_MAX)
+		return false;
+
+	for (unsigned j = 0; j < KEY_PTRS(l); j++)
+		if (l->ptr[j] + PTR(0, KEY_SIZE(l), 0) != r->ptr[j] ||
+		    PTR_BUCKET(b->c, l, j) != PTR_BUCKET(b->c, r, j))
+			return false;
+
+	if (KEY_CSUM(l)) {
+		if (KEY_CSUM(r))
+			l->ptr[KEY_PTRS(l)] = merge_chksums(l, r);
+		else
+			SET_KEY_CSUM(l, 0);
+	}
+
+	SET_KEY_SIZE(l, KEY_SIZE(l) + KEY_SIZE(r));
+	l->key += KEY_SIZE(r);
+
+	return true;
 }
 
 static bool __cut_front(const struct bkey *where, struct bkey *k)
@@ -1617,7 +1704,7 @@ static void __submit_bbio(struct bio *bio, struct cache_set *c)
 static void submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
 {
 	struct bbio *b = container_of(bio, struct bbio, bio);
-	bkey_copy(&b->key, k);
+	bkey_copy_single_ptr(&b->key, k, 0);
 
 	__submit_bbio(bio, c);
 }
@@ -1705,24 +1792,28 @@ static void cache_endio(struct cache_set *c, struct bio *bio,
 
 /* Btree/bkey debug printing */
 
+#define KEYHACK_SIZE 80
 struct keyprint_hack {
-	char s[40];
+	char s[KEYHACK_SIZE];
 };
 
 static struct keyprint_hack _pkey(const struct bkey *k)
 {
 	struct keyprint_hack r;
-	int i = scnprintf(r.s, 40, "%llu:%llu len %llu -> ",
+	int i = scnprintf(r.s, KEYHACK_SIZE, "%llu:%llu len %llu -> ",
 			 KEY_DEV(k), k->key, KEY_SIZE(k));
 
 	if (KEY_PTRS(k))
-		i += scnprintf(r.s + i, 40 - i, "%llu gen %llu",
+		i += scnprintf(r.s + i, KEYHACK_SIZE - i, "%llu gen %llu",
 			      PTR_OFFSET(k, 0), PTR_GEN(k, 0));
 	else
-		i += scnprintf(r.s + i, 40 - i, "[]");
+		i += scnprintf(r.s + i, KEYHACK_SIZE - i, "[]");
 
 	if (KEY_DIRTY(k))
-		scnprintf(r.s + i, 40 - i, " dirty");
+		i += scnprintf(r.s + i, KEYHACK_SIZE - i, " dirty");
+	if (KEY_CSUM(k))
+		i += scnprintf(r.s + i, KEYHACK_SIZE - i,
+			       " cs%llu %llx", KEY_CSUM(k), k->ptr[1]);
 	return r;
 }
 
@@ -1801,6 +1892,11 @@ static struct bkey *keylist_pop(struct keylist *l)
 
 static void keylist_push(struct keylist *l)
 {
+#ifdef CONFIG_BCACHE_EDEBUG
+	uint64_t *i = (uint64_t *) l->top;
+	while (++i < (uint64_t *) next(l->top))
+		BUG_ON(KEY_IS_HEADER((struct bkey *) i));
+#endif
 	BUG_ON(!KEY_IS_HEADER(l->top));
 	l->top = next(l->top);
 }
@@ -3312,52 +3408,57 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	unsigned sectors = k->key - sector;
 	struct bio *ret;
 	struct block_device *bdev;
-	struct bucket *g = PTR_BUCKET(b->c, k, 0);
 
 	if (keylist_realloc(&op->keys, 1))
 		return ERR_PTR(-ENOMEM);
 
-	atomic_inc(&g->pin);
-	smp_mb__after_atomic_inc();
+	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
+		struct bucket *g = PTR_BUCKET(b->c, k, i);
 
-	if (ptr_stale(b->c, k, 0)) {
-		atomic_dec_bug(&g->pin);
-		return NULL;
+		atomic_inc(&g->pin);
+		smp_mb__after_atomic_inc();
+
+		if (ptr_stale(b->c, k, i)) {
+			atomic_dec_bug(&g->pin);
+			continue;
+		}
+
+		/* For multiple cache devices, copy only the pointer we're
+		 * actually reading from
+		 */
+		bkey_copy_single_ptr(op->keys.top, k, i);
+		BUG_ON(KEY_PTRS(op->keys.top) != 1);
+
+		bdev = PTR_CACHE(b->c, k, i)->bdev;
+		sector += KEY_SIZE(k) - k->key + PTR_OFFSET(k, i);
+		sectors = min(sectors, __bio_max_sectors(bio, bdev, sector));
+
+		ret = bio_split_get(bio, sectors, b->c);
+		if (!ret) {
+			atomic_dec_bug(&g->pin);
+			return ERR_PTR(-ENOMEM);
+		}
+
+		g->prio = initial_prio;
+		/* * (cache_hit_seek + cache_hit_priority
+		 * bio_sectors(bio) / c->sb.bucket_size)
+		 / (cache_hit_seek + cache_hit_priority);*/
+
+		pr_debug("cache hit of %i sectors from %llu, need %i sectors",
+			 bio_sectors(ret), (uint64_t) ret->bi_sector,
+			 ret == bio ? 0 : bio_sectors(bio));
+
+		SET_PTR_OFFSET(op->keys.top, 0, sector);
+
+		ret->bi_end_io = cache_read_endio;
+
+		submit_bbio(ret, b->c, op->keys.top);
+		keylist_push(&op->keys);
+
+		return ret;
 	}
 
-	/* For multiple cache devices, copy only the pointer we're actually
-	 * reading from
-	 */
-	bkey_copy(op->keys.top, k);
-	SET_KEY_PTRS(op->keys.top, 1);
-
-	bdev = PTR_CACHE(b->c, k, 0)->bdev;
-	sector += KEY_SIZE(k) - k->key + PTR_OFFSET(k, 0);
-	sectors = min(sectors, __bio_max_sectors(bio, bdev, sector));
-
-	ret = bio_split_get(bio, sectors, b->c);
-	if (!ret) {
-		atomic_dec_bug(&g->pin);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	g->prio = initial_prio;
-			/* * (cache_hit_seek + cache_hit_priority
-			 * bio_sectors(bio) / c->sb.bucket_size)
-			/ (cache_hit_seek + cache_hit_priority);*/
-
-	pr_debug("cache hit of %i sectors from %llu, need %i sectors",
-		 bio_sectors(ret), (uint64_t) ret->bi_sector,
-		 ret == bio ? 0 : bio_sectors(bio));
-
-	SET_PTR_OFFSET(op->keys.top, 0, sector);
-
-	ret->bi_end_io	= cache_read_endio;
-
-	submit_bbio(ret, b->c, op->keys.top);
-	keylist_push(&op->keys);
-
-	return ret;
+	return NULL;
 }
 
 #define SEARCH(op, bio) KEY((op)->d->id, (bio)->bi_sector, 0)
@@ -3438,33 +3539,6 @@ static int btree_search_recurse(struct btree *b, struct search *s,
 }
 
 /* Garbage collection */
-
-/* Tries to merge l and r: l should be lower than r
- * Returns true if we were able to merge. If we did merge, l will be the merged
- * key, r will be untouched.
- */
-static bool btree_try_merge(struct btree *b, struct bkey *l, struct bkey *r)
-{
-	if (KEY_PTRS(l) != KEY_PTRS(r) ||
-	    KEY_DIRTY(l) != KEY_DIRTY(r) ||
-	    bkey_cmp(l, &START_KEY(r)))
-		return false;
-
-	/* Keys with no pointers aren't restricted to one bucket, and buckets
-	 * could be bigger max key size:
-	 */
-	if (KEY_SIZE(l) + KEY_SIZE(r) > USHRT_MAX)
-		return false;
-
-	for (unsigned j = 0; j < KEY_PTRS(l); j++)
-		if (l->ptr[j] + PTR(0, KEY_SIZE(l), 0) != r->ptr[j] ||
-		    PTR_BUCKET(b->c, l, j) != PTR_BUCKET(b->c, r, j))
-			return false;
-
-	SET_KEY_SIZE(l, KEY_SIZE(l) + KEY_SIZE(r));
-	l->key		+= KEY_SIZE(r);
-	return true;
-}
 
 static void btree_sort_fixup(struct btree_iter *iter)
 {
@@ -3547,7 +3621,7 @@ static void __btree_sort(struct btree *b, int start, struct bset *new,
 			last = out->start;
 			bkey_copy(last, k);
 		} else if (b->level ||
-			   !btree_try_merge(b, last, k)) {
+			   !bkey_try_merge(b, last, k)) {
 			last = next(last);
 			bkey_copy(last, k);
 		}
@@ -3663,9 +3737,9 @@ static int btree_gc_mark(struct btree *b, size_t *keys, struct gc_stat *gc)
 
 	gc->nodes++;
 	for_each_key_filter(b, k, ptr_bad) {
-		*keys += 2 + KEY_PTRS(k);
+		*keys += key_u64s(k);
 
-		gc->key_bytes += 2 + KEY_PTRS(k);
+		gc->key_bytes += key_u64s(k);
 		gc->nkeys++;
 
 		gc->data += KEY_SIZE(k);
@@ -3986,7 +4060,7 @@ out:
 
 static void shift_keys(struct bset *i, struct bkey *where, struct bkey *insert)
 {
-	unsigned n = 2 + KEY_PTRS(insert);
+	unsigned n = key_u64s(insert);
 	uint64_t *src = i->d + i->keys;
 	uint64_t *dst = i->d + i->keys + n;
 
@@ -4148,7 +4222,7 @@ static bool btree_insert_keys(struct btree *b, struct btree_op *op)
 				/* m is in the tree, if we merge we're done */
 
 				status = "back merging";
-				if (btree_try_merge(b, m, k))
+				if (bkey_try_merge(b, m, k))
 					goto merged;
 
 				m = next(m);
@@ -4160,7 +4234,7 @@ static bool btree_insert_keys(struct btree *b, struct btree_op *op)
 					goto copy;
 
 				status = "front merge";
-				if (btree_try_merge(b, k, m))
+				if (bkey_try_merge(b, k, m))
 					goto copy;
 			}
 		} else
@@ -5618,7 +5692,9 @@ static void bio_insert(struct closure *cl)
 		struct open_bucket *b;
 		struct bkey *k;
 
-		if (keylist_realloc(&op->keys, 1))
+		/* 1 for the device pointer and 1 for the chksum */
+		if (keylist_realloc(&op->keys,
+				    1 + (op->d->data_csum ? 1 : 0)))
 			return_f(cl, btree_journal);
 
 		k = op->keys.top;
@@ -5629,14 +5705,18 @@ static void bio_insert(struct closure *cl)
 
 		put_data_bucket(b, op->d->c, k, bio);
 
-		if (op->insert_type == INSERT_WRITEBACK)
-			SET_KEY_DIRTY(k, true);
-
 		n = bio_split_get(bio, KEY_SIZE(k), op->d->c);
 		if (!n) {
 			__bkey_put(op->d->c, k);
 			return_f(cl, bio_insert);
 		}
+
+		if (op->insert_type == INSERT_WRITEBACK)
+			SET_KEY_DIRTY(k, true);
+
+		SET_KEY_CSUM(k, op->d->data_csum);
+		if (op->d->data_csum)
+			bio_csum(n, k);
 
 		pr_debug("%s", pkey(k));
 		keylist_push(&op->keys);
@@ -6276,6 +6356,7 @@ rw_attribute(congested_threshold_us);
 
 rw_attribute(sequential_cutoff);
 rw_attribute(sequential_merge);
+rw_attribute(data_csum);
 rw_attribute(writeback);
 rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
@@ -7249,6 +7330,7 @@ static ssize_t show_dev(struct kobject *kobj, struct attribute *attr, char *buf)
 #define d_print(var)		sysfs_print(var, d->var)
 #define d_hprint(var)		sysfs_hprint(var, d->var)
 
+	d_printf(data_csum,		"%i");
 	d_printf(writeback,		"%i");
 	d_printf(writeback_metadata,	"%i");
 	d_printf(writeback_running,	"%i");
@@ -7283,6 +7365,7 @@ static ssize_t __store_dev(struct cached_dev *d, struct attribute *attr,
 #define d_strtoul(var)		sysfs_strtoul(var, d->var)
 #define d_strtoi_h(var)		sysfs_hatoi(var, d->var)
 
+	d_strtoul(data_csum);
 	d_strtoul(writeback_metadata);
 	d_strtoul(writeback_running);
 	d_strtoul(writeback_delay);
@@ -7438,6 +7521,7 @@ static int register_dev_kobj(struct cached_dev *d)
 		/* Not ready yet
 		&sysfs_unregister,
 		*/
+		&sysfs_data_csum,
 		&sysfs_writeback,
 		&sysfs_writeback_metadata,
 		&sysfs_writeback_running,

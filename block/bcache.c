@@ -406,7 +406,7 @@ struct cache_set {
 	int			nr_uuids;
 	struct uuid_entry	*uuids;
 	BKEY_PADDED(uuid_bucket);
-	struct closure		*uuid_writer;
+	struct closure		uuid_write;
 
 	struct mutex		fill_lock;
 	struct btree_iter	*fill_iter;
@@ -1685,14 +1685,15 @@ static struct bio *bio_split_get(struct bio *bio, int len, struct cache_set *c)
 	return ret;
 }
 
-static void __submit_bbio(struct bio *bio, struct cache_set *c)
+static void submit_bbio(struct bio *bio, struct cache_set *c,
+			struct bkey *k, unsigned ptr)
 {
 	struct bbio *b = container_of(bio, struct bbio, bio);
+	bkey_copy_single_ptr(&b->key, k, ptr);
 
 	BUG_ON(bio->bi_destructor &&
 	       (bio->bi_destructor != bbio_destructor) &&
 	       (bio->bi_destructor != (void *) c->bio_split));
-	BUG_ON(KEY_PTRS(&b->key) != 1);
 
 	bio->bi_sector	= PTR_OFFSET(&b->key, 0);
 	bio->bi_bdev	= PTR_CACHE(c, &b->key, 0)->bdev;
@@ -1701,12 +1702,35 @@ static void __submit_bbio(struct bio *bio, struct cache_set *c)
 	generic_make_request(bio);
 }
 
-static void submit_bbio(struct bio *bio, struct cache_set *c, struct bkey *k)
+static int submit_bbio_split(struct bio *bio, struct cache_set *c,
+			     struct bkey *k, unsigned ptr)
 {
-	struct bbio *b = container_of(bio, struct bbio, bio);
-	bkey_copy_single_ptr(&b->key, k, 0);
+	struct bbio *b;
+	struct bio *n;
+	unsigned sectors_done = 0;
 
-	__submit_bbio(bio, c);
+	bio->bi_sector	= PTR_OFFSET(k, ptr);
+	bio->bi_bdev	= PTR_CACHE(c, k, ptr)->bdev;
+
+	do {
+		n = bio_split_front(bio, bio_max_sectors(bio),
+				    NULL, GFP_NOIO, c->bio_split);
+		if (!n)
+			return -ENOMEM;
+		else if (n != bio)
+			closure_get(bio->bi_private);
+
+		b = container_of(n, struct bbio, bio);
+
+		bkey_copy_single_ptr(&b->key, k, ptr);
+		SET_KEY_SIZE(&b->key, KEY_SIZE(k) - sectors_done);
+		SET_PTR_OFFSET(&b->key, 0, PTR_OFFSET(k, ptr) + sectors_done);
+
+		b->time = ktime_get();
+		generic_make_request(n);
+	} while (n != bio);
+
+	return 0;
 }
 
 /* IO errors */
@@ -3452,7 +3476,7 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 
 		ret->bi_end_io = cache_read_endio;
 
-		submit_bbio(ret, b->c, op->keys.top);
+		submit_bbio(ret, b->c, op->keys.top, 0);
 		keylist_push(&op->keys);
 
 		return ret;
@@ -5151,36 +5175,31 @@ static void set_new_root(struct btree *b)
 
 static void uuid_endio(struct bio *bio, int error)
 {
-	struct cache *c = bio->bi_private;
-	count_io_errors(c, error, "accessing uuids");
-
-	bio_put(bio);
-	closure_put(c->set->uuid_writer, delayed);
+	/* XXX: check for io errors */
+	cache_endio(container_of(bio->bi_private, struct cache_set, uuid_write),
+		    bio, error, "accessing uuids");
 }
 
 static void uuid_io(struct cache_set *c, unsigned long rw,
 		    struct bkey *k, struct closure *cl)
 {
 	lockdep_assert_held(&register_lock);
-	/* XXX: check for io errors */
-	c->uuid_writer = cl;
+	closure_init(&c->uuid_write, cl);
+	cl = &c->uuid_write;
 
 	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
-		struct cache *ca = PTR_CACHE(c, k, i);
-		struct bio *bio = ca->uuid_bio;
+		struct bio *bio = PTR_CACHE(c, k, i)->uuid_bio;
 
 		bio_reset(bio);
-		bio->bi_sector	= PTR_OFFSET(k, i);
-		bio->bi_bdev	= ca->bdev;
 		bio->bi_rw	= REQ_SYNC|REQ_META|rw;
 		bio->bi_size	= KEY_SIZE(k) << 9;
 
 		bio->bi_end_io	= uuid_endio;
-		bio->bi_private = ca;
+		bio->bi_private = cl;
 		bio_map(bio, c->uuids);
 
 		closure_get(cl);
-		closure_bio_submit(bio, cl, c->bio_split);
+		submit_bbio_split(bio, c, k, i);
 
 		if (!(rw & WRITE))
 			break;
@@ -5193,6 +5212,7 @@ static void uuid_io(struct cache_set *c, unsigned long rw,
 			pr_debug("Slot %zi: %pU: %s: 1st: %u last: %u inv: %u",
 				 u - c->uuids, u->uuid, u->label,
 				 u->first_reg, u->last_reg, u->invalidated);
+	return_f(cl, NULL);
 }
 
 static int uuid_write(struct cache_set *c)
@@ -5729,7 +5749,7 @@ static void bio_insert(struct closure *cl)
 		cl->fn = btree_journal;
 		n->bi_rw |= REQ_WRITE;
 
-		submit_bbio(n, op->d->c, k);
+		submit_bbio(n, op->d->c, k, 0);
 	} while (n != bio);
 
 	return;
@@ -8652,7 +8672,7 @@ static struct cache *alloc_cache(struct cache_sb *sb)
 	    !(c->prio_buckets	= kzalloc(sizeof(uint64_t) * prio_buckets(c) *
 					  2, GFP_KERNEL)) ||
 	    !(c->disk_buckets	= alloc_bucket_pages(GFP_KERNEL, c)) ||
-	    !(c->uuid_bio	= bio_kmalloc(GFP_KERNEL, bucket_pages(c))) ||
+	    !(c->uuid_bio	= bbio_kmalloc(GFP_KERNEL, bucket_pages(c))) ||
 	    !(c->prio_bio	= bio_kmalloc(GFP_KERNEL, bucket_pages(c))))
 		goto err;
 

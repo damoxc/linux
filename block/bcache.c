@@ -5687,8 +5687,7 @@ static void __bio_complete(struct search *s)
 		if (s->error)
 			clear_bit(BIO_UPTODATE, &s->orig_bio->bi_flags);
 
-		if (s->orig_bio->bi_end_io)
-			s->orig_bio->bi_end_io(s->orig_bio, s->error);
+		bio_endio(s->orig_bio, s->error);
 		s->orig_bio = NULL;
 	}
 }
@@ -5888,6 +5887,7 @@ static void __do_bio_hook(struct search *s)
 	struct bio *bio = &s->bio.bio;
 	memcpy(bio, s->orig_bio, sizeof(struct bio));
 
+	bio->bi_flowid		= NULL;
 	bio->bi_end_io		= request_endio;
 	bio->bi_private		= &s->cl;
 	bio->bi_destructor	= NULL;

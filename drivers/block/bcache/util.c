@@ -7,8 +7,11 @@
 #include <linux/ratelimit.h>
 #include "util.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Kent Overstreet <kent.overstreet@gmail.com>");
+#define CREATE_TRACE_POINTS
+#include <trace/events/bcache.h>
+
+EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_start_closure_wait);
+EXPORT_TRACEPOINT_SYMBOL_GPL(bcache_end_closure_wait);
 
 #define STRTO_H(name, type)					\
 int name ## _h(const char *cp, type *res)		        \
@@ -119,6 +122,10 @@ int parse_uuid(const char *s, char *uuid)
 	return i;
 }
 EXPORT_SYMBOL_GPL(parse_uuid);
+
+#ifdef CONFIG_BCACHE_LATENCY_DEBUG
+unsigned latency_warn_ms;
+#endif
 
 #ifdef CONFIG_BCACHE_EDEBUG
 

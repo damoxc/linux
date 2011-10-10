@@ -3456,6 +3456,10 @@ static int btree_search_recurse(struct btree *b, struct search *s,
 
 /* Garbage collection */
 
+/* Tries to merge l and r: l should be lower than r
+ * Returns true if we were able to merge. If we did merge, l will be the merged
+ * key, r will be untouched.
+ */
 static bool btree_try_merge(struct btree *b, struct bkey *l, struct bkey *r)
 {
 	if (KEY_PTRS(l) != KEY_PTRS(r) ||
@@ -3476,7 +3480,6 @@ static bool btree_try_merge(struct btree *b, struct bkey *l, struct bkey *r)
 
 	SET_KEY_SIZE(l, KEY_SIZE(l) + KEY_SIZE(r));
 	l->key		+= KEY_SIZE(r);
-	bkey_copy(r, l);
 	return true;
 }
 
@@ -4028,8 +4031,8 @@ static void shift_keys(struct bset *i, struct bkey *where, struct bkey *insert)
 		dst[1] = src[1];
 	}
 
-	bkey_copy(where, insert);
 	i->keys += n;
+	bkey_copy(where, insert);
 }
 
 static bool check_old_keys(struct btree *b, struct bkey *k,
@@ -4135,34 +4138,6 @@ wb_failed:	atomic_long_inc(&b->c->writeback_keys_failed);
 
 static bool btree_insert_keys(struct btree *b, struct btree_op *op)
 {
-	bool merge(struct bset *i, struct bkey *m, struct bkey *k)
-	{
-		if (m != i->start) {
-			m = prev(m);
-
-			if (KEY_PTRS(m) == KEY_PTRS(k) && !KEY_SIZE(m))
-				goto copy;
-
-			if (btree_try_merge(b, m, k))
-				return true;
-
-			m = next(m);
-		}
-
-		if (m != end(i)) {
-			if (KEY_PTRS(m) == KEY_PTRS(k) && !KEY_SIZE(m))
-				goto copy;
-
-			if (btree_try_merge(b, k, m))
-				return true;
-		}
-
-		return false;
-copy:
-		bkey_copy(m, k);
-		return true;
-	}
-
 	/* If a read generates a cache miss, and a write to the same location
 	 * finishes before the new data is added to the cache, the write will
 	 * be overwritten with stale data. We can catch this by never
@@ -4173,7 +4148,7 @@ copy:
 	struct bkey *k, *m;
 
 	while ((k = keylist_pop(&op->keys))) {
-		const char *status = "replacing";
+		const char *status = "insert";
 		unsigned oldsize = count_data(b);
 
 		BUG_ON(b->level && !KEY_PTRS(k));
@@ -4196,24 +4171,47 @@ copy:
 			while (m != end(i) && bkey_cmp(k, &START_KEY(m)) > 0)
 				m = next(m);
 
-			if (merge(i, m, k))
-				goto merged;
+			if (m != i->start) {
+				m = prev(m);
+
+				status = "overwrote back";
+				if (KEY_PTRS(m) == KEY_PTRS(k) && !KEY_SIZE(m))
+					goto copy;
+
+				/* m is in the tree, if we merge we're done */
+
+				status = "back merging";
+				if (btree_try_merge(b, m, k))
+					goto merged;
+
+				m = next(m);
+			}
+
+			if (m != end(i)) {
+				status = "overwrote front";
+				if (KEY_PTRS(m) == KEY_PTRS(k) && !KEY_SIZE(m))
+					goto copy;
+
+				status = "front merge";
+				if (btree_try_merge(b, k, m))
+					goto copy;
+			}
 		} else
 			m = bset_search(b, b->nsets, k);
 
-		status = "inserting";
 		shift_keys(i, m, k);
-merged:
-		check_key_order_msg(b, i, "was last %s %s", status, pkey(k));
+copy:		bkey_copy(m, k);
+merged:		ret = true;
+
+		check_key_order_msg(b, i, "%s for %s at %s: %s", status,
+				    insert_type(op), pbtree(b), pkey(k));
 		BUG_ON(count_data(b) < oldsize);
-		ret = true;
 
 		if (b->level && !k->key)
 			b->prio_blocked++;
 
-		pr_debug("%s for %s at %s block %zu key %zu/%i: %s",
-			 status, insert_type(op), pbtree(b),
-			 index(i, b), m - i->start, i->keys, pkey(k));
+		pr_debug("%s for %s at %s: %s", status,
+			 insert_type(op), pbtree(b), pkey(k));
 	}
 
 	return ret;

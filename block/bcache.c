@@ -56,6 +56,7 @@
  * register_bcache: Return errors out to userspace correctly
  *
  * Writeback: don't undirty key until after a cache flush
+ *
  * Create an iterator for key pointers
  *
  * On btree write error, mark bucket such that it won't be freed from the cache
@@ -67,10 +68,7 @@
  *
  * Garbage collection:
  *   Finish incremental gc
- *   Track number of gcs, average gc time and sigma, export in sysfs
- *   Trace via blktrace when gc starts and ends
  *   Gc should free old UUIDs, data for invalid UUIDs
- *   Need to wait on all writes to complete
  *
  * Provide a way to list backing device UUIDs we have data cached for, and
  * probably how long it's been since we've seen them, and a way to invalidate
@@ -397,6 +395,7 @@ struct cache_set {
 	struct work_struct	gc_work;
 	struct mutex		gc_lock;
 	struct bkey		gc_done;
+	int			gc_mark_valid;
 	atomic_t		sectors_to_gc;
 
 	struct btree		*root;
@@ -1988,12 +1987,6 @@ static void invalidate_buckets(struct cache *c)
 	struct bucket *b;
 	size_t pinned = 0, gc_gen = 0, disk_gen = 0;
 
-	if (!mutex_trylock(&c->set->gc_lock))
-		return;
-
-	if (bkey_cmp(&c->set->gc_done, &MAX_KEY))
-		goto out;
-
 	c->heap.used = 0;
 
 	for_each_bucket(b, c) {
@@ -2015,7 +2008,7 @@ static void invalidate_buckets(struct cache *c)
 		}
 
 		if (fifo_full(&c->unused))
-			goto out;
+			return;
 	}
 
 	if (c->heap.used * 2 < c->heap.size) {
@@ -2040,8 +2033,6 @@ static void invalidate_buckets(struct cache *c)
 		atomic_inc(&b->pin);
 		fifo_push(&c->free_inc, b - c->buckets);
 	}
-out:
-	mutex_unlock(&c->set->gc_lock);
 }
 
 static void free_some_buckets(struct cache *c)
@@ -2078,7 +2069,8 @@ static void free_some_buckets(struct cache *c)
 	     c->need_save_prio > 64))
 		atomic_set(&c->prio_written, 0);
 
-	if (atomic_read(&c->prio_written) ||
+	if (!c->set->gc_mark_valid ||
+	    atomic_read(&c->prio_written) ||
 	    atomic_read(&c->set->prio_blocked))
 		return;
 
@@ -2134,7 +2126,8 @@ again:
 
 		closure_wait_on(&c->set->bucket_wait, delayed, cl,
 				atomic_read(&c->prio_written) > 0 ||
-				(!atomic_read(&c->set->prio_blocked) &&
+				(c->set->gc_mark_valid &&
+				 !atomic_read(&c->set->prio_blocked) &&
 				 !atomic_read(&c->prio_written)));
 
 		if (test_bit(CLOSURE_BLOCK, &cl->flags)) {
@@ -2304,7 +2297,7 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 			err = "btree";
 			if (KEY_DIRTY(k) ||
 			    g->prio != btree_prio ||
-			    (!bkey_cmp(&b->c->gc_done, &MAX_KEY) &&
+			    (b->c->gc_mark_valid &&
 			     g->mark != GC_MARK_BTREE))
 				goto bug;
 		} else {
@@ -2314,7 +2307,7 @@ static bool ptr_bad(struct btree *b, const struct bkey *k)
 
 			err = "dirty";
 			if (KEY_DIRTY(k) &&
-			    !bkey_cmp(&b->c->gc_done, &MAX_KEY) &&
+			    b->c->gc_mark_valid &&
 			    g->mark != GC_MARK_DIRTY)
 				goto bug;
 		}
@@ -3639,8 +3632,13 @@ static int btree_gc_mark(struct btree *b, size_t *keys, struct gc_stat *gc)
 	}
 
 	for_each_key_filter(b, k, ptr_invalid) {
-		for (unsigned i = 0; i < KEY_PTRS(k); i++)
+		for (unsigned i = 0; i < KEY_PTRS(k); i++) {
 			ret = max(ret, ptr_stale(b->c, k, i));
+
+			btree_bug_on(gen_after(PTR_BUCKET(b->c, k, i)->last_gc,
+					       PTR_GEN(k, i)),
+				     b, "found old gen in gc");
+		}
 
 		btree_mark_key(b, k);
 	}
@@ -3693,7 +3691,7 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 	}
 
 	int ret = 0, stale;
-	size_t dirty, keys, pkeys = 0;
+	size_t keys, pkeys = 0;
 	struct btree *r, *p = NULL;
 	struct bkey *k;
 
@@ -3704,7 +3702,7 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 			break;
 		}
 
-		keys = dirty = 0;
+		keys = 0;
 		stale = btree_gc_mark(r, &keys, gc);
 
 		if (!b->written &&
@@ -3718,8 +3716,6 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 			write(r);
 			break;
 		}
-
-		bkey_copy_key(&b->c->gc_done, k);
 
 		pkeys = __set_blocks(b->data, pkeys + keys, b->c);
 		if (p && pkeys < (btree_blocks(b) * 2) / 3) {
@@ -3749,12 +3745,19 @@ static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 		lock_set_subclass(&r->lock.dep_map, 0, _THIS_IP_);
 		p = r;
 		pkeys = keys;
+		bkey_copy_key(&b->c->gc_done, k);
 
 		/* When we've got incremental GC working, we'll want to do
 		 * if (should_resched())
 		 *	return -EAGAIN;
 		 */
 		cond_resched();
+#if 0
+		if (need_resched()) {
+			ret = -EAGAIN;
+			break;
+		}
+#endif
 	}
 
 	if (p)
@@ -3822,7 +3825,7 @@ static size_t btree_gc_finish(struct cache_set *c)
 	spin_lock(&c->bucket_lock);
 
 	set_gc_sectors(c);
-	c->gc_done	= MAX_KEY;
+	c->gc_mark_valid = 1;
 	c->need_gc	= 0;
 	c->min_prio	= initial_prio;
 
@@ -3883,21 +3886,15 @@ static void btree_gc(struct work_struct *w)
 
 	blktrace_msg_all(c, "Starting gc");
 
+	if (!mutex_trylock(&c->gc_lock))
+		return;
+
 	spin_lock(&c->bucket_lock);
 	for_each_cache(ca, c)
 		free_some_buckets(ca);
-	spin_unlock(&c->bucket_lock);
 
-	/* So pop_bucket() doesn't spin while we're blocking
-	 * invalidate_buckets()
-	 */
-	atomic_inc(&c->prio_blocked);
-	smp_mb__after_atomic_inc();
-
-	if (!mutex_trylock(&c->gc_lock))
-		goto out;
-
-	if (!bkey_cmp(&c->gc_done, &MAX_KEY)) {
+	if (c->gc_mark_valid) {
+		c->gc_mark_valid = 0;
 		c->gc_done = ZERO_KEY;
 
 		for_each_cache(ca, c)
@@ -3905,6 +3902,7 @@ static void btree_gc(struct work_struct *w)
 				if (!atomic_read(&b->pin))
 					b->mark = 0;
 	}
+	spin_unlock(&c->bucket_lock);
 
 	ret = btree_root(gc_root, c, &op, &op, &writes, &stats);
 	closure_sync(&op.cl);
@@ -3914,7 +3912,7 @@ static void btree_gc(struct work_struct *w)
 		blktrace_msg_all(c, "Stopped gc");
 		printk(KERN_WARNING "bcache: gc failed!\n");
 		queue_work(delayed, &c->gc_work);
-		goto out_unlock;
+		goto out;
 	}
 
 	/* Possibly wait for new UUIDs or whatever to hit disk */
@@ -3935,10 +3933,8 @@ static void btree_gc(struct work_struct *w)
 	stats.in_use	= (c->nbuckets - available) * 100 / c->nbuckets;
 	memcpy(&c->gc_stats, &stats, sizeof(struct gc_stat));
 	blktrace_msg_all(c, "Finished gc");
-out_unlock:
-	mutex_unlock(&c->gc_lock);
 out:
-	atomic_dec(&c->prio_blocked);
+	mutex_unlock(&c->gc_lock);
 	closure_run_wait(&c->bucket_wait, delayed);
 }
 
@@ -4326,9 +4322,8 @@ static int __btree_insert_async(struct btree_op *op, struct cache_set *c)
 	keylist_init(&op->keys);
 
 	while (c->need_gc > MAX_NEED_GC) {
-		/* XXX: maybe use a wait list? */
-		mutex_lock(&c->gc_lock);
-		mutex_unlock(&c->gc_lock);
+		closure_wait_on(&c->bucket_wait, delayed, &op->cl,
+				atomic_read(&c->prio_blocked) == 0);
 
 		if (c->need_gc > MAX_NEED_GC)
 			btree_gc(&c->gc_work);

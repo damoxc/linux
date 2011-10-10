@@ -1217,22 +1217,6 @@ static int bcache_congested(void *data, int bits)
 	return ret;
 }
 
-static void bcache_unplug(struct request_queue *q)
-{
-	struct cached_dev *d = q->queuedata;
-
-	blk_unplug(bdev_get_queue(d->bdev));
-
-	if (cached_dev_get(d)) {
-		struct cache *c;
-
-		for_each_cache(c, d->c)
-			blk_unplug(bdev_get_queue(c->bdev));
-
-		cached_dev_put(d);
-	}
-}
-
 static const char *register_bdev(struct cache_sb *sb, struct page *sb_page,
 				 struct block_device *bdev)
 {
@@ -1270,7 +1254,6 @@ static const char *register_bdev(struct cache_sb *sb, struct page *sb_page,
 
 	q = bdev_get_queue(d->bdev);
 
-	d->disk->queue->unplug_fn		= bcache_unplug;
 	d->disk->queue->queuedata		= d;
 	d->disk->queue->limits.max_hw_sectors	= q->limits.max_hw_sectors;
 	d->disk->queue->limits.max_sectors	= q->limits.max_sectors;

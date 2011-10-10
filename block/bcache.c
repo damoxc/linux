@@ -26,6 +26,7 @@
 #include <linux/blkdev.h>
 #include <linux/blktrace_api.h>
 #include <linux/buffer_head.h>
+#include <linux/cgroup.h>
 #include <linux/console.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
@@ -50,6 +51,7 @@
 #include <linux/workqueue.h>
 
 #include "bcache_util.h"
+#include "blk-cgroup.h"
 
 /*
  * Todo:
@@ -783,6 +785,12 @@ struct btree_op {
 	} insert_type:8;
 };
 
+const char *insert_types[] = {
+	"read", "write", NULL, "writeback", "undirty", NULL, "replay"
+};
+
+#define insert_type(s)	insert_types[(s)->insert_type]
+
 struct search {
 	/* Stack frame for bio_complete */
 	struct closure		cl;
@@ -809,13 +817,6 @@ struct search {
 	unsigned short		pages_from;
 };
 
-const char *insert_types[] = {
-	"read", "write", NULL, "writeback",
-	"undirty", NULL, "replay"
-}
-
-#define insert_type(s)	insert_types[(s)->insert_type]
-
 #define CREATE_TRACE_POINTS
 #include <trace/events/bcache.h>
 
@@ -830,13 +831,40 @@ static LIST_HEAD(cache_sets);
 static struct kmem_cache *search_cache, *dirty_cache;
 static struct workqueue_struct *delayed, *writeback;
 static int bcache_major, bcache_minor;
-
-/*
- * Sysfs vars / tunables
- */
 static uint16_t	initial_prio = 32768;
+
 #ifdef CONFIG_BCACHE_LATENCY_DEBUG
 unsigned latency_warn_ms;
+#endif
+
+static struct bcache_cgroup {
+	struct cgroup_subsys_state	css;
+	bool				writeback;
+	bool				writethrough;
+} bcache_default_cgroup;
+
+#ifdef CONFIG_CGROUP_BCACHE
+
+struct bcache_cgroup *cgroup_to_bcache(struct cgroup *cgroup)
+{
+	return cgroup
+		? container_of(cgroup_subsys_state(cgroup, bcache_subsys_id),
+			       struct bcache_cgroup, css)
+		: &bcache_default_cgroup;
+}
+
+static struct bcache_cgroup *bio_to_cgroup(struct bio *bio)
+{
+	return cgroup_to_bcache(get_bio_cgroup(bio));
+}
+
+#else
+
+static struct bcache_cgroup *bio_to_cgroup(struct bio *bio)
+{
+	return &bcache_default_cgroup;
+}
+
 #endif
 
 static void dump_bucket_and_panic(struct btree *, const char *, ...);
@@ -6065,6 +6093,20 @@ static void request_read(struct search *s)
 	__request_read(&s->op.cl);
 }
 
+static bool should_writeback(struct cached_dev *d, struct bio *bio)
+{
+	struct bcache_cgroup *cg = bio_to_cgroup(bio);
+
+	if (cg->writethrough ||
+	    (!d->writeback && !cg->writeback) ||
+	    (!d->writeback_metadata && (bio->bi_rw & REQ_META)))
+		return false;
+
+	return d->c->gc_stats.in_use < (bio->bi_rw & REQ_SYNC)
+		? CUTOFF_WRITEBACK_SYNC
+		: CUTOFF_WRITEBACK;
+}
+
 static void request_write(struct search *s)
 {
 	struct bio *bio = &s->bio.bio;
@@ -6088,14 +6130,8 @@ skip:		s->cache_bio = s->orig_bio;
 		return;
 	}
 
-	if (s->op.d->writeback &&
-	    (s->op.d->writeback_metadata ||
-	     !(bio->bi_rw & REQ_META))) {
-		int i = s->op.d->c->gc_stats.in_use;
-		if (i < CUTOFF_WRITEBACK ||
-		    (i < CUTOFF_WRITEBACK_SYNC && bio->bi_rw & REQ_SYNC))
-			s->op.insert_type = INSERT_WRITEBACK;
-	}
+	if (should_writeback(s->op.d, bio))
+		s->op.insert_type = INSERT_WRITEBACK;
 
 	if (s->op.insert_type == INSERT_WRITE) {
 		s->cache_bio = bbio_kmalloc(GFP_NOIO, bio->bi_max_vecs);
@@ -8553,6 +8589,95 @@ err_nofree:
 	return NULL;
 }
 
+/* Cgroup interface */
+
+#ifdef CONFIG_CGROUP_BCACHE
+
+static u64 bcache_writethrough_read(struct cgroup *cgrp, struct cftype *cft)
+{
+	struct bcache_cgroup *bcachecg = cgroup_to_bcache(cgrp);
+	return bcachecg->writethrough;
+}
+
+static int bcache_writethrough_write(struct cgroup *cgrp, struct cftype *cft,
+				     u64 val)
+{
+	struct bcache_cgroup *bcachecg = cgroup_to_bcache(cgrp);
+	bcachecg->writethrough = val;
+	return 0;
+}
+
+static u64 bcache_writeback_read(struct cgroup *cgrp, struct cftype *cft)
+{
+	struct bcache_cgroup *bcachecg = cgroup_to_bcache(cgrp);
+	return bcachecg->writeback;
+}
+
+static int bcache_writeback_write(struct cgroup *cgrp, struct cftype *cft,
+				  u64 val)
+{
+	struct bcache_cgroup *bcachecg = cgroup_to_bcache(cgrp);
+	bcachecg->writeback = val;
+	return 0;
+}
+
+struct cftype bcache_files[] = {
+	{
+		.name		= "writethrough",
+		.read_u64	= bcache_writethrough_read,
+		.write_u64	= bcache_writethrough_write,
+	},
+	{
+		.name		= "writeback",
+		.read_u64	= bcache_writeback_read,
+		.write_u64	= bcache_writeback_write,
+	},
+};
+
+static void init_bcache_cgroup(struct bcache_cgroup *cg)
+{
+	cg->writeback = false;
+	cg->writethrough = false;
+}
+
+static struct cgroup_subsys_state *
+bcachecg_create(struct cgroup_subsys *subsys, struct cgroup *cgroup)
+{
+	struct bcache_cgroup *cg;
+
+	cg = kzalloc(sizeof(*cg), GFP_KERNEL);
+	if (!cg)
+		return ERR_PTR(-ENOMEM);
+	init_bcache_cgroup(cg);
+	return &cg->css;
+}
+
+static void bcachecg_destroy(struct cgroup_subsys *subsys,
+			     struct cgroup *cgroup)
+{
+	struct bcache_cgroup *cg = cgroup_to_bcache(cgroup);
+	free_css_id(&bcache_subsys, &cg->css);
+	kfree(cg);
+}
+
+static int bcachecg_populate(struct cgroup_subsys *subsys,
+			     struct cgroup *cgroup)
+{
+	return cgroup_add_files(cgroup, subsys, bcache_files,
+				ARRAY_SIZE(bcache_files));
+}
+
+struct cgroup_subsys bcache_subsys = {
+	.create		= bcachecg_create,
+	.destroy	= bcachecg_destroy,
+	.populate	= bcachecg_populate,
+	.subsys_id	= bcache_subsys_id,
+	.name		= "bcache",
+	.module		= THIS_MODULE,
+};
+EXPORT_SYMBOL_GPL(bcache_subsys);
+#endif
+
 /* Global interfaces/init */
 
 static ssize_t register_bcache(struct kobject *, struct kobj_attribute *,
@@ -8651,6 +8776,10 @@ static int __init bcache_init(void)
 
 	debug = debugfs_create_dir("bcache", NULL);
 
+#ifdef CONFIG_CGROUP_BCACHE
+	cgroup_load_subsys(&bcache_subsys);
+	init_bcache_cgroup(&bcache_default_cgroup);
+#endif
 	return 0;
 err:
 	if (writeback)
@@ -8669,6 +8798,9 @@ static void bcache_exit(void)
 	if (!IS_ERR_OR_NULL(debug))
 		debugfs_remove_recursive(debug);
 
+#ifdef CONFIG_CGROUP_BCACHE
+	cgroup_unload_subsys(&bcache_subsys);
+#endif
 	kobject_put(bcache_kobj);
 	destroy_workqueue(writeback);
 	destroy_workqueue(delayed);

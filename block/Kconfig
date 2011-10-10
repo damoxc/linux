@@ -135,6 +135,12 @@ config BCACHE_LATENCY_DEBUG
 	which defaults to 0. If nonzero, any timed operation that takes longer
 	emits a printk.
 
+config CGROUP_BCACHE
+  bool "Cgroup controls for bcache"
+  depends on BCACHE && BLK_CGROUP
+  ---help---
+  TODO
+
 endif # BLOCK
 
 config BLOCK_COMPAT

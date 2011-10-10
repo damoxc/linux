@@ -548,7 +548,7 @@ do {									\
 	clear_bit(CLOSURE_BLOCK, &(_c)->flags);				\
 	(_c)->fn = _f;							\
 	smp_mb__before_atomic_dec();					\
-	closure_put(_c, current->bio_list ? delayed : NULL);		\
+	closure_put(_c, current->bio_list ? bcache_wq : NULL);		\
 	return __VA_ARGS__;						\
 } while (0)
 

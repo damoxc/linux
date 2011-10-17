@@ -1985,9 +1985,6 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 	struct bio *ret;
 	struct block_device *bdev;
 
-	if (keylist_realloc(&op->keys, 1))
-		return ERR_PTR(-ENOMEM);
-
 	for (unsigned i = 0; i < KEY_PTRS(k); i++) {
 		struct bucket *g = PTR_BUCKET(b->c, k, i);
 
@@ -2029,7 +2026,6 @@ static struct bio *cache_hit(struct btree *b, struct bio *bio,
 		ret->bi_end_io = cache_read_endio;
 
 		submit_bbio(ret, b->c, op->keys.top, 0);
-		keylist_push(&op->keys);
 
 		return ret;
 	}

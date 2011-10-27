@@ -8,3 +8,5 @@ kernel_file	= arch/$(build_arch)/boot/bzImage
 install_file	= vmlinuz
 loader		= grub
 no_dumpfile	= true
+skipmodule  = true
+skipabi     = true

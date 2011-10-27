@@ -1,3 +1,16 @@
+linux (3.1.0-2.4) oneiric; urgency=low
+
+  * Add latest ceph patches.
+
+ -- Damien Churchill <damien.churchill@ukplc.net>  Thu, 27 Oct 2011 11:56:31 +0100
+
+linux (3.1.0-2.3) oneiric; urgency=low
+
+  * Add bcache patches and configuration.
+  * [Config] enable CONFIG_BCACHE=y on amd64
+
+ -- Damien Churchill <damien.churchill@ukplc.net>  Thu, 27 Oct 2011 11:04:04 +0100
+
 linux (3.1.0-2.2) precise; urgency=low
 
   [ Andy Whitcroft ]

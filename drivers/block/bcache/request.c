@@ -850,6 +850,40 @@ static void request_read_done(struct closure *cl)
 	struct search *s = container_of(cl, struct search, cl);
 	struct bio_vec *bv;
 
+	if (s->op.d->verify && s->recoverable) {
+		int i;
+		struct bio *check;
+
+		__bio_for_each_segment(bv, s->orig_bio, i, 0)
+			bv->bv_offset = 0, bv->bv_len = PAGE_SIZE;
+
+		check = bio_clone(s->orig_bio, GFP_NOIO);
+		bio_alloc_pages(check, GFP_NOIO);
+
+		check->bi_rw = 0;
+		check->bi_private = cl;
+		check->bi_end_io = readahead_endio;
+
+		bio_get(check);
+		closure_get(cl);
+		closure_bio_submit(check, cl, s->op.d->c->bio_split);
+		closure_sync(cl);
+
+		__bio_for_each_segment(bv, s->orig_bio, i, 0) {
+			void *p1 = kmap(bv->bv_page);
+			void *p2 = kmap(check->bi_io_vec[i].bv_page);
+
+			BUG_ON(memcmp(p1, p2, PAGE_SIZE));
+
+			kunmap(bv->bv_page);
+			kunmap(check->bi_io_vec[i].bv_page);
+		}
+
+		__bio_for_each_segment(bv, check, i, 0)
+			__free_page(bv->bv_page);
+		bio_put(check);
+	}
+
 	if (s->cache_bio && !s->error && !atomic_read(&s->op.d->c->closing)) {
 		bv = bio_iovec_idx(s->cache_bio, s->pages_from);
 
@@ -902,7 +936,7 @@ static void request_read_done_bh(struct closure *cl)
 		return_f(&s->op.cl, __request_read);
 	}
 
-	if (s->cache_bio) {
+	if (s->cache_bio || s->op.d->verify) {
 		cl->fn = request_read_done;
 		closure_queue(cl, bcache_wq);
 	} else

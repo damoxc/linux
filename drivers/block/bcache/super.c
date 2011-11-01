@@ -1,6 +1,7 @@
 
 #include "bcache.h"
 #include "btree.h"
+#include "debug.h"
 
 #include <linux/buffer_head.h>
 #include <linux/debugfs.h>
@@ -1387,6 +1388,7 @@ SHOW(__cache_set)
 		     ((uint64_t) get_congested(c)) << 9);
 	sysfs_print(congested_threshold_us,	c->congested_threshold_us);
 	sysfs_print(active_journal_entries,	fifo_used(&c->journal.pin));
+	sysfs_printf(verify,			"%i", c->verify);
 
 	if (attr == &sysfs_bset_tree_stats)
 		return bset_print_stats(c, buf);
@@ -1436,6 +1438,8 @@ STORE(__cache_set)
 		c->error_decay = halflife / 88;
 		return ret ?: (ssize_t) size;
 	}
+
+	sysfs_strtoul(verify, c->verify);
 
 	return size;
 }
@@ -1513,6 +1517,7 @@ static void cache_set_free(struct kobject *kobj)
 	for_each_cache(ca, c)
 		kobject_put(&ca->kobj);
 
+	bcache_debug_cache_set_free(c);
 	free_open_buckets(c);
 	free_btree_cache(c);
 	free_journal(c);
@@ -1597,6 +1602,9 @@ struct cache_set *cache_set_alloc(struct cache_sb *sb)
 		&sysfs_bset_tree_stats,
 		&sysfs_writeback_keys_done,
 		&sysfs_writeback_keys_failed,
+#ifdef CONFIG_BCACHE_DEBUG
+		&sysfs_verify,
+#endif
 		NULL
 	};
 	KTYPE(cache_set_internal, unregister_fake);
@@ -1664,7 +1672,8 @@ struct cache_set *cache_set_alloc(struct cache_sb *sb)
 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||
 	    alloc_journal(c) ||
 	    alloc_btree_cache(c) ||
-	    alloc_open_buckets(c))
+	    alloc_open_buckets(c) ||
+	    bcache_debug_cache_set_alloc(c))
 		goto err;
 
 	c->fill_iter->size = sb->bucket_size / sb->block_size;

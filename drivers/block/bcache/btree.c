@@ -1561,7 +1561,6 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 			}
 	}
 
-	bool overwrote = false;
 	struct bset *w = write_block(b);
 
 	while (1) {
@@ -1635,17 +1634,12 @@ static bool check_old_keys(struct btree *b, struct bkey *k,
 				rebuild(j);
 			}
 		}
-
-		overwrote = true;
 	}
 
 	if (op->insert_type == INSERT_UNDIRTY) {
 wb_failed:	atomic_long_inc(&b->c->writeback_keys_failed);
 		return true;
 	}
-
-	if (!KEY_PTRS(k) && !overwrote)
-		return true;
 
 	return false;
 }

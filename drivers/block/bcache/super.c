@@ -1071,6 +1071,7 @@ found:
 
 static void cached_dev_free(struct kobject *kobj)
 {
+	char name[BDEVNAME_SIZE] = "(unknown)";
 	struct cached_dev *d = container_of(kobj, struct cached_dev, kobj);
 
 	lockdep_assert_held(&register_lock);
@@ -1081,10 +1082,16 @@ static void cached_dev_free(struct kobject *kobj)
 	if (d->c)
 		kobject_put(&d->c->kobj);
 
+	if (d->bio_split)
+		bioset_free(d->bio_split);
+
 	if (!IS_ERR_OR_NULL(d->bdev)) {
+		bdevname(d->bdev, name);
 		blk_sync_queue(bdev_get_queue(d->bdev));
 		blkdev_put(d->bdev, FMODE_READ|FMODE_WRITE);
 	}
+
+	printk(KERN_INFO "bcache: Device %s unregistered\n", name);
 
 	list_del(&d->list);
 	kfree(d);
@@ -1165,7 +1172,14 @@ static struct cached_dev *cached_dev_alloc(void)
 
 	bcache_writeback_init_cached_dev(d);
 
+	d->bio_split = bioset_create(4, offsetof(struct bbio, bio));
+	if (!d)
+		goto err;
+
 	return d;
+err:
+	cached_dev_free(&d->kobj);
+	return NULL;
 }
 
 /* Backing device - bcache superblock */
@@ -1504,8 +1518,6 @@ static void cache_set_free(struct kobject *kobj)
 
 	lockdep_assert_held(&register_lock);
 
-	list_del(&c->list);
-
 	if (!IS_ERR_OR_NULL(c->root))
 		list_add(&c->root->lru, &c->lru);
 
@@ -1542,9 +1554,10 @@ static void cache_set_free(struct kobject *kobj)
 	if (c->search)
 		mempool_destroy(c->search);
 
-	printk(KERN_DEBUG "bcache: Cache set %pU unregistered\n",
+	printk(KERN_INFO "bcache: Cache set %pU unregistered\n",
 	       c->sb.set_uuid);
 
+	list_del(&c->list);
 	kfree(c);
 	module_put(THIS_MODULE);
 }
@@ -1679,7 +1692,7 @@ struct cache_set *cache_set_alloc(struct cache_sb *sb)
 	iter_size = (sb->bucket_size / sb->block_size + 1) *
 		sizeof(struct btree_iter_set);
 
-	if (!(c->bio_split = bioset_create(64, offsetof(struct bbio, bio))) ||
+	if (!(c->bio_split = bioset_create(4, offsetof(struct bbio, bio))) ||
 	    !(c->fill_iter = kmalloc(iter_size, GFP_KERNEL)) ||
 	    !(c->sort = alloc_bucket_pages(GFP_KERNEL, c)) ||
 	    !(c->uuids = alloc_bucket_pages(GFP_KERNEL, c)) ||
